@@ -45,11 +45,11 @@ Run once as `ACCOUNTADMIN` (Snowsight worksheet or any SQL client). Paste the co
 ```sql
 CREATE USER IF NOT EXISTS DEVELOPER_SVC
   TYPE = SERVICE
-  RSA_PUBLIC_KEY = '<contents of rsa_key.pub, header/footer/newlines removed>'
+  RSA_PUBLIC_KEY = '<contents of rsa_key.pub>'
   DEFAULT_ROLE = SYSADMIN
   DEFAULT_WAREHOUSE = CRYPTO_WH
   MUST_CHANGE_PASSWORD = FALSE
-  COMMENT = 'Infra CI/CD service account (infra-deploy.yml) — key-pair auth only, no interactive login';
+  COMMENT = 'Infra CI/CD service account key-pair auth';
 
 GRANT ROLE SYSADMIN  TO USER DEVELOPER_SVC;  -- create/manage warehouses, databases, schemas, tables
 GRANT ROLE USERADMIN TO USER DEVELOPER_SVC;  -- create/manage CRYPTO_PIPELINE_ROLE
