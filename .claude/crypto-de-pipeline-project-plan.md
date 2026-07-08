@@ -33,9 +33,11 @@ crypto-pipeline/
 │       └── de-deploy.yml           # ingest, then promote dev_db -> qa_db -> prod_db
 └── de-pipeline/
     ├── ingestion/
-    │   ├── ingest_coingecko.py      # main ingestion script
+    │   ├── ingest_coingecko.py      # main ingestion script (local CSV or Snowflake)
     │   ├── requirements.txt
-    │   └── config.py                # env-based config
+    │   ├── config.py                # env-based config (INGEST_MODE=local|snowflake)
+    │   ├── .env                     # gitignored — local secrets/mode override
+    │   └── data/                    # gitignored — CSV output from local runs
     ├── dbt/
     │   ├── dbt_project.yml
     │   ├── profiles.yml             # uses env vars — never commit secrets
@@ -196,15 +198,49 @@ ALTER TASK CRYPTO_DB.STG.TASK_NOTIFY_NEW_DATA RESUME;
 
 ## Step 3 — Python ingestion script
 
-Ingestion always writes to the shared landing database/schema (`CRYPTO_DB.STG`), regardless of environment.
+Ingestion supports two modes via `config.py` / `INGEST_MODE`:
+
+- **`local`** (default) — fetches from CoinGecko and writes a CSV to `ingestion/data/`. No Snowflake credentials required. Use this to test the script and eyeball the data before it ever touches Snowflake.
+- **`snowflake`** — same fetch, but loads rows into the shared landing table `CRYPTO_DB.STG.COINGECKO_RAW` instead of writing a CSV.
+
+Both modes share the same `fetch_coins()` / `build_rows()` logic, so there's nothing to keep in sync between "what I tested locally" and "what gets loaded."
+
+### `config.py` — env-based config
+
+```python
+# ingestion/config.py
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # loads ingestion/.env if present — never commit that file
+
+# "local" writes a CSV under CSV_OUTPUT_DIR; "snowflake" loads into Snowflake
+INGEST_MODE = os.getenv("INGEST_MODE", "local")
+
+CSV_OUTPUT_DIR = os.getenv("CSV_OUTPUT_DIR", "data")
+
+SNOWFLAKE_ACCOUNT   = os.getenv("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_USER      = os.getenv("SNOWFLAKE_USER")
+SNOWFLAKE_PASSWORD  = os.getenv("SNOWFLAKE_PASSWORD")
+SNOWFLAKE_ROLE      = os.getenv("SNOWFLAKE_ROLE", "CRYPTO_PIPELINE_ROLE")
+SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH")
+SNOWFLAKE_DATABASE  = os.getenv("SNOWFLAKE_DATABASE", "CRYPTO_DB")
+SNOWFLAKE_SCHEMA    = os.getenv("SNOWFLAKE_SCHEMA", "STG")
+```
+
+### `ingest_coingecko.py`
 
 ```python
 # ingestion/ingest_coingecko.py
-
+import csv
 import os
+from datetime import datetime, timezone
+
 import requests
 import snowflake.connector
-from datetime import datetime, timezone
+
+import config
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 PARAMS = {
@@ -215,67 +251,143 @@ PARAMS = {
     "sparkline": False,
 }
 
+FIELDNAMES = [
+    "id", "symbol", "name", "current_price", "market_cap", "total_volume",
+    "price_change_24h", "price_change_pct_24h", "high_24h", "low_24h",
+    "circulating_supply", "ath", "fetched_at",
+]
+
 def fetch_coins():
     resp = requests.get(COINGECKO_URL, params=PARAMS, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
-def get_snowflake_conn():
-    return snowflake.connector.connect(
-        account   = os.environ["SNOWFLAKE_ACCOUNT"],
-        user      = os.environ["SNOWFLAKE_USER"],
-        password  = os.environ["SNOWFLAKE_PASSWORD"],
-        role      = "CRYPTO_PIPELINE_ROLE",
-        warehouse = "CRYPTO_WH",
-        database  = "CRYPTO_DB",
-        schema    = "STG",
-    )
-
-def load_to_snowflake(coins: list):
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    rows = [
-        (
-            c["id"], c["symbol"], c["name"],
-            c.get("current_price"),
-            c.get("market_cap"),
-            c.get("total_volume"),
-            c.get("price_change_24h"),
-            c.get("price_change_percentage_24h"),
-            c.get("high_24h"),
-            c.get("low_24h"),
-            c.get("circulating_supply"),
-            c.get("ath"),
-            fetched_at,
-        )
+def build_rows(coins: list, fetched_at: str) -> list[dict]:
+    return [
+        {
+            "id": c["id"],
+            "symbol": c["symbol"],
+            "name": c["name"],
+            "current_price": c.get("current_price"),
+            "market_cap": c.get("market_cap"),
+            "total_volume": c.get("total_volume"),
+            "price_change_24h": c.get("price_change_24h"),
+            "price_change_pct_24h": c.get("price_change_percentage_24h"),
+            "high_24h": c.get("high_24h"),
+            "low_24h": c.get("low_24h"),
+            "circulating_supply": c.get("circulating_supply"),
+            "ath": c.get("ath"),
+            "fetched_at": fetched_at,
+        }
         for c in coins
     ]
 
-    insert_sql = """
-        INSERT INTO CRYPTO_DB.STG.COINGECKO_RAW (
+def save_to_csv(rows: list[dict], fetched_at: str) -> str:
+    os.makedirs(config.CSV_OUTPUT_DIR, exist_ok=True)
+    stamp = fetched_at.replace(":", "").replace("-", "").replace("+00:00", "Z")
+    path = os.path.join(config.CSV_OUTPUT_DIR, f"coingecko_raw_{stamp}.csv")
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[local] Wrote {len(rows)} rows to {path}")
+    return path
+
+def get_snowflake_conn():
+    return snowflake.connector.connect(
+        account   = config.SNOWFLAKE_ACCOUNT,
+        user      = config.SNOWFLAKE_USER,
+        password  = config.SNOWFLAKE_PASSWORD,
+        role      = config.SNOWFLAKE_ROLE,
+        warehouse = config.SNOWFLAKE_WAREHOUSE,
+        database  = config.SNOWFLAKE_DATABASE,
+        schema    = config.SNOWFLAKE_SCHEMA,
+    )
+
+def save_to_snowflake(rows: list[dict]) -> None:
+    insert_sql = f"""
+        INSERT INTO {config.SNOWFLAKE_DATABASE}.{config.SNOWFLAKE_SCHEMA}.COINGECKO_RAW (
             id, symbol, name, current_price, market_cap,
             total_volume, price_change_24h, price_change_pct_24h,
             high_24h, low_24h, circulating_supply, ath, fetched_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (
+            %(id)s, %(symbol)s, %(name)s, %(current_price)s, %(market_cap)s,
+            %(total_volume)s, %(price_change_24h)s, %(price_change_pct_24h)s,
+            %(high_24h)s, %(low_24h)s, %(circulating_supply)s, %(ath)s, %(fetched_at)s
+        )
     """
     conn = get_snowflake_conn()
     try:
         cur = conn.cursor()
         cur.executemany(insert_sql, rows)
         conn.commit()
-        print(f"Loaded {len(rows)} rows at {fetched_at}")
+        print(f"[snowflake] Loaded {len(rows)} rows into "
+              f"{config.SNOWFLAKE_DATABASE}.{config.SNOWFLAKE_SCHEMA}.COINGECKO_RAW")
     finally:
         conn.close()
 
-if __name__ == "__main__":
+def main():
     coins = fetch_coins()
-    load_to_snowflake(coins)
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    rows = build_rows(coins, fetched_at)
+
+    if config.INGEST_MODE == "snowflake":
+        save_to_snowflake(rows)
+    else:
+        save_to_csv(rows, fetched_at)
+
+if __name__ == "__main__":
+    main()
 ```
 
 ```
 # ingestion/requirements.txt
 requests==2.31.0
 snowflake-connector-python==3.6.0
+python-dotenv==1.0.1
 ```
+
+### Local virtual environment & testing
+
+```powershell
+# from repo root, PowerShell
+cd de-pipeline
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r ingestion\requirements.txt
+```
+
+```bash
+# macOS/Linux/bash equivalent
+cd de-pipeline
+python -m venv .venv
+source .venv/bin/activate
+pip install -r ingestion/requirements.txt
+```
+
+Run in local mode first — no Snowflake credentials needed, output lands in `ingestion/data/coingecko_raw_<timestamp>.csv`:
+
+```powershell
+python ingestion\ingest_coingecko.py
+```
+
+Once the CSV looks correct, switch to Snowflake mode by setting `INGEST_MODE=snowflake` plus credentials (either export env vars or drop them in `ingestion/.env`, which `config.py` loads automatically via `python-dotenv`):
+
+```powershell
+# ingestion/.env (gitignored — never commit)
+INGEST_MODE=snowflake
+SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+SNOWFLAKE_USER=pipeline_svc
+SNOWFLAKE_PASSWORD=********
+```
+
+```powershell
+python ingestion\ingest_coingecko.py
+```
+
+Add `.venv/`, `ingestion/data/`, and `ingestion/.env` to `.gitignore` — none of them should be committed.
 
 ---
 
