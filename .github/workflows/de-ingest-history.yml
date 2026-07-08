@@ -1,0 +1,42 @@
+name: DE Ingest History (manual backfill)
+
+# One-off historical backfill — MANUAL ONLY (no schedule). Each run fetches
+# daily data from HISTORY_START_DATE (default 2026-01-01) through the run date
+# for the top-50 coins and appends it to CRYPTO_DB.STG.COINGECKO_HISTORY_RAW.
+# Separate from de-ingest.yml, which runs the daily snapshot on a cron.
+
+on:
+  workflow_dispatch:
+    inputs:
+      history_start_date:
+        description: 'Backfill start date (YYYY-MM-DD). End is always the run date. Older than ~365 days needs a paid CoinGecko key.'
+        required: false
+        default: '2026-01-01'
+
+jobs:
+  backfill:
+    name: Backfill CoinGecko history -> CRYPTO_DB.STG.COINGECKO_HISTORY_RAW
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r de-pipeline/ingestion/requirements.txt
+
+      - name: Run historical backfill (INGEST_MODE=snowflake)
+        working-directory: de-pipeline/ingestion
+        run: python backfill_coingecko_history.py
+        env:
+          INGEST_MODE:        snowflake
+          HISTORY_START_DATE: ${{ inputs.history_start_date }}
+          # Reaching back past the last 365 days needs a paid CoinGecko plan.
+          # Set the COINGECKO_API_KEY secret and COINGECKO_API_PLAN var (=pro) to use it.
+          COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_PLAN: ${{ vars.COINGECKO_API_PLAN || 'demo' }}
+          SNOWFLAKE_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:     ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}

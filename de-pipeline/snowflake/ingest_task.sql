@@ -1,13 +1,23 @@
 -- snowflake/ingest_task.sql
--- Requires one-time ACCOUNTADMIN setup — see README.md
--- "One-time ACCOUNTADMIN setup for production ingestion":
---   - EXECUTE TASK granted to SYSADMIN (needed to resume/run any task, this
---     one included, and also covers streams.sql/tasks.sql from Step 2)
---   - CRYPTO_DB.STG.COINGECKO_NETWORK_RULE + COINGECKO_ACCESS_INTEGRATION created
---   - USAGE on COINGECKO_ACCESS_INTEGRATION granted to SYSADMIN
--- Without those: CREATE PROCEDURE below fails because the integration it
--- references doesn't exist yet, and ALTER TASK ... RESUME fails because
--- SYSADMIN lacks EXECUTE TASK by default.
+-- DISABLED — requires an External Access Integration, which needs the
+-- global CREATE INTEGRATION privilege (ACCOUNTADMIN only). Not available
+-- on a Snowflake trial account. Production ingestion is instead
+-- ingest_coingecko.py, run by the standalone de-ingest.yml workflow.
+--
+-- This file is intentionally NOT passed to run_sql.py in infra-deploy.yml
+-- (see .github/workflows/infra-deploy.yml) — nothing here ever executes.
+--
+-- To re-enable once the account supports External Access Integrations:
+--   1. As ACCOUNTADMIN, create the network rule + integration + grant
+--      USAGE to SYSADMIN (see README.md "1.5 One-time ACCOUNTADMIN setup
+--      for production ingestion" / the project plan's Step 3b for the
+--      exact statements this file used to contain before being disabled).
+--   2. Uncomment everything below.
+--   3. Add "ingest_task.sql" back to run_sql.py's file list in
+--      infra-deploy.yml.
+--   4. Decide whether to keep the de-ingest.yml workflow running too, or
+--      retire it in favor of this Task — running both would double-insert
+--      rows into CRYPTO_DB.STG.COINGECKO_RAW.
 
 USE ROLE SYSADMIN;
 

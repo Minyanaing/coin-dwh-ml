@@ -36,6 +36,21 @@ CREATE TABLE IF NOT EXISTS CRYPTO_DB.STG.COINGECKO_RAW (
   _loaded_at               TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
+-- Historical daily backfill (append-only). Populated on-demand by the
+-- manual backfill_coingecko_history.py script / de-ingest-history.yml
+-- workflow — one row per coin per day from HISTORY_START_DATE to run date.
+CREATE TABLE IF NOT EXISTS CRYPTO_DB.STG.COINGECKO_HISTORY_RAW (
+  id                       VARCHAR,
+  symbol                   VARCHAR,
+  name                     VARCHAR,
+  price_date               DATE,
+  price                    FLOAT,
+  market_cap               FLOAT,
+  total_volume             FLOAT,
+  fetched_at               TIMESTAMP_NTZ,
+  _loaded_at               TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
 -- ============================================================
 -- DEV_DB — dbt development target
 -- ============================================================

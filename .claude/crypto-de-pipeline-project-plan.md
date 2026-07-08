@@ -6,7 +6,9 @@
 
 ## Project overview
 
-A production-grade daily crypto market data pipeline that ingests OHLC prices and market cap data for the top 50 tokens from CoinGecko, lands them in a shared Snowflake landing database via a scheduled Snowflake Python Task, and promotes them through dbt-built Silver/Gold layers across three isolated environment databases (dev → qa → prod) — with CI/CD and environment promotion gates enforced through GitHub Actions.
+A production-grade daily crypto market data pipeline that ingests OHLC prices and market cap data for the top 50 tokens from CoinGecko, lands them in a shared Snowflake landing database via a scheduled GitHub Actions job (daily, 8AM Bangkok time), and promotes them through dbt-built Silver/Gold layers across three isolated environment databases (dev → qa → prod) — with CI/CD and environment promotion gates enforced through GitHub Actions.
+
+> A Snowflake-native Python Task alternative for ingestion exists in the codebase (`snowflake/ingest_task.sql`, Step 3b) but is currently **disabled** — it requires an External Access Integration, which isn't available on the Snowflake trial account this was built against. The code is kept commented out for later, once the account is upgraded. Production ingestion runs the GitHub Actions way (Step 3a / Step 5) for now.
 
 ### Database / schema architecture
 
@@ -31,12 +33,13 @@ coin-dwh-ml/
 ├── .github/
 │   └── workflows/
 │       ├── infra-ci.yml             # PR: sqlfluff syntax check on snowflake/**
-│       ├── infra-deploy.yml         # merge to main: apply setup/streams/tasks/ingest_task to Snowflake
+│       ├── infra-deploy.yml         # merge to main: apply setup/streams/tasks to Snowflake (ingest_task disabled)
+│       ├── de-ingest.yml            # cron 8AM Bangkok: run ingest_coingecko.py -> CRYPTO_DB.STG (standalone)
 │       ├── de-ci.yml                # PR: dbt build + test against dev_db
-│       └── de-deploy.yml            # promote dev_db -> qa_db -> prod_db (no ingestion here)
+│       └── de-deploy.yml            # promote dev_db -> qa_db -> prod_db (dbt only, no ingestion)
 └── de-pipeline/
     ├── ingestion/
-    │   ├── ingest_coingecko.py      # LOCAL TESTING ONLY — not scheduled, not deployed
+    │   ├── ingest_coingecko.py      # PRODUCTION ingestion (run by de-ingest.yml) + local testing
     │   ├── requirements.txt
     │   ├── config.py                # env-based config (INGEST_MODE=local|snowflake)
     │   ├── .env                     # gitignored — local secrets/mode override
@@ -66,7 +69,7 @@ coin-dwh-ml/
     │   ├── setup.sql                # warehouses, databases, roles, schemas
     │   ├── streams.sql              # Snowflake Stream definition
     │   ├── tasks.sql                # Snowflake Task (new-data signal)
-    │   ├── ingest_task.sql          # PRODUCTION ingestion: network rule + integration + Python proc + Task
+    │   ├── ingest_task.sql          # DISABLED — Snowflake Task ingestion, needs External Access Integration (not on trial)
     │   ├── run_sql.py               # applies *.sql via key-pair auth (used by infra-deploy.yml)
     │   └── requirements.txt         # snowflake-connector-python, cryptography
     ├── .keys/                       # gitignored — local rsa_key.p8 / rsa_key.pub
@@ -212,17 +215,15 @@ ALTER TASK CRYPTO_DB.STG.TASK_NOTIFY_NEW_DATA RESUME;
 
 ## Step 3 — Ingestion
 
-Ingestion has two separate implementations that intentionally do **not** share deployment infrastructure:
+- **3a. `ingestion/ingest_coingecko.py`** — this is what actually runs in production. The same script serves double duty: run it locally (`INGEST_MODE=local`, the default) to test against a CSV with no Snowflake credentials, or let its **own dedicated workflow `de-ingest.yml`** run it on a daily schedule (`INGEST_MODE=snowflake`) to load `CRYPTO_DB.STG.COINGECKO_RAW`. Ingestion is deliberately a **separate** GitHub Action from dbt promotion (`de-deploy.yml`, Step 5) — the two run on independent schedules and neither blocks the other.
+- **3b. A Snowflake Python Task** (`snowflake/ingest_task.sql`) — a from-inside-Snowflake alternative, **currently disabled**. It requires an External Access Integration for network egress, which the Snowflake trial account this was built against can't create. The code stays in the repo, commented out, for when the account is upgraded — see the note at the end of 3b for what re-enabling it involves.
 
-- **3a. `ingestion/ingest_coingecko.py`** — a local Python script, kept purely as a **local testing / reference tool**. It is never scheduled and never deployed; nothing in CI/CD invokes it. Use it to eyeball CoinGecko's response shape or sanity-check a write against a dev schema by hand.
-- **3b. A Snowflake Python Task** (`snowflake/ingest_task.sql`) — this is what actually runs in production, on a schedule, entirely inside Snowflake. There's no external host, no separate secret to rotate for the CoinGecko call, and no GitHub Actions job to babysit — the schedule, the code, and the data all live in one system.
+### 3a. Production + local ingestion script
 
-### 3a. Local testing script (reference only — not used for deployment)
-
-`config.py` / `INGEST_MODE` supports two modes, both purely for local use:
+`config.py` / `INGEST_MODE` supports two modes:
 
 - **`local`** (default) — fetches from CoinGecko and writes a CSV to `ingestion/data/`. No Snowflake credentials required. Use this to test the script and eyeball the data before it ever touches Snowflake.
-- **`snowflake`** — same fetch, but loads rows into the shared landing table `CRYPTO_DB.STG.COINGECKO_RAW` instead of writing a CSV. Useful for manually verifying the write path against a dev schema — **not** how production data gets loaded (see 3b).
+- **`snowflake`** — same fetch, but loads rows into the shared landing table `CRYPTO_DB.STG.COINGECKO_RAW` instead of writing a CSV. This is the mode `de-ingest.yml` runs in production (see below); running it locally is for manually verifying the write path before trusting the scheduled job.
 
 Both modes share the same `fetch_coins()` / `build_rows()` logic, so there's nothing to keep in sync between "what I tested locally" and "what gets loaded."
 
@@ -418,122 +419,63 @@ python ingestion/ingest_coingecko.py
 
 Add `.venv/`, `ingestion/data/`, and `ingestion/.env` to `.gitignore` — none of them should be committed.
 
-### 3b. Production ingestion — Snowflake Python Task
+#### Scheduled ingestion — `de-ingest.yml`
 
-This is what actually runs on a schedule. A Snowflake Task calls a Python stored procedure (Snowpark) that fetches CoinGecko and appends straight into `CRYPTO_DB.STG.COINGECKO_RAW` — no external script, no separate credentials for the CoinGecko call, no GitHub Actions job. The task authenticates as whatever role owns it (no password/key to manage for ingestion itself), and reaching `api.coingecko.com` from inside Snowflake requires an **External Access Integration**.
+Production ingestion runs as its **own** GitHub Actions workflow, separate from `de-deploy.yml`. Keeping it standalone means: the daily data pull can be retried on its own without re-running dbt, its logs and run history aren't interleaved with promotion runs, and a change to the ingestion script triggers nothing else. It runs daily at **8:00 AM Bangkok time (ICT, UTC+7)** — `1:00 AM UTC`, since GitHub Actions cron is always specified in UTC and Thailand has no daylight saving to complicate the offset — plus a manual **Run workflow** button.
 
-**Two things here require `ACCOUNTADMIN` and are deliberately kept manual, documented in `README.md` — not granted to `SYSADMIN` and not automated in `infra-deploy.yml`:**
+```yaml
+# .github/workflows/de-ingest.yml
+name: DE Ingest
 
-1. **`EXECUTE TASK`** — an account-level privilege only `ACCOUNTADMIN` holds by default. Without it, `ALTER TASK ... RESUME` fails for *any* task `SYSADMIN` owns, including `TASK_NOTIFY_NEW_DATA` from Step 2. This one **is** granted to `SYSADMIN` once (folded into README's Step 1.2, alongside the `SYSADMIN`/`USERADMIN` grants) since ongoing automation depends on it.
-2. **`CREATE EXTERNAL ACCESS INTEGRATION`** — also account-level, requiring the global `CREATE INTEGRATION` privilege. Unlike `EXECUTE TASK`, this is **not** granted to `SYSADMIN` — it's a rarely-changed, high-privilege capability (arbitrary network egress) better left as an audited manual step than something CI can invoke. `ACCOUNTADMIN` creates the network rule + integration once by hand (README Step 1.4); `SYSADMIN` only needs `USAGE` on the already-created integration to reference it when creating the procedure.
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 1:00 AM UTC = 8:00 AM Bangkok time (ICT, UTC+7, no DST)
+  workflow_dispatch:        # manual run button
 
-```sql
--- Run once, manually, as ACCOUNTADMIN — after snowflake/setup.sql has
--- already created CRYPTO_DB.STG (see README.md "1.5 One-time ACCOUNTADMIN
--- setup for production ingestion")
+jobs:
+  ingest:
+    name: Ingest CoinGecko -> CRYPTO_DB.STG.COINGECKO_RAW
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
--- Egress allowlist: only CoinGecko's public REST API, nothing else
-CREATE NETWORK RULE IF NOT EXISTS CRYPTO_DB.STG.COINGECKO_NETWORK_RULE
-  MODE = EGRESS
-  TYPE = HOST_PORT
-  VALUE_LIST = ('api.coingecko.com');
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS COINGECKO_ACCESS_INTEGRATION
-  ALLOWED_NETWORK_RULES = (CRYPTO_DB.STG.COINGECKO_NETWORK_RULE)
-  ENABLED = TRUE;
+      - name: Install dependencies
+        run: pip install -r de-pipeline/ingestion/requirements.txt
 
--- SYSADMIN creates and owns the procedure/task below, and needs USAGE on
--- the integration to reference it in CREATE PROCEDURE.
-GRANT USAGE ON INTEGRATION COINGECKO_ACCESS_INTEGRATION TO ROLE SYSADMIN;
+      - name: Run ingestion (INGEST_MODE=snowflake)
+        working-directory: de-pipeline/ingestion
+        run: python ingest_coingecko.py
+        env:
+          INGEST_MODE:        snowflake
+          SNOWFLAKE_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:     ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
 ```
 
-Everything below this point is ordinary `SYSADMIN` work — once the manual block above has run, `ingest_task.sql` is exactly as idempotent as `setup.sql`/`streams.sql`/`tasks.sql` and applies cleanly through the normal `infra-deploy.yml` pipeline, with no further `ACCOUNTADMIN` involvement:
+It authenticates with the same `SNOWFLAKE_USER` / `SNOWFLAKE_PASSWORD` (`CRYPTO_PIPELINE_ROLE`) secrets as the dbt workflows — `config.py` reads them straight from the environment (Step 6). There's no `push:` trigger: the script's behaviour doesn't change on merge, only on the schedule, so a code push doesn't need to fire a real data load.
 
-```sql
--- snowflake/ingest_task.sql
--- Requires the manual ACCOUNTADMIN block above (network rule, integration,
--- USAGE grant) plus the EXECUTE TASK grant from README Step 1.2 to already
--- exist — otherwise CREATE PROCEDURE fails (integration not found) and
--- ALTER TASK ... RESUME fails (missing EXECUTE TASK).
+### 3b. Snowflake Python Task ingestion (disabled — kept for later)
 
-USE ROLE SYSADMIN;
+**Status: not in use.** This was designed as a from-inside-Snowflake alternative to 3a — a Snowflake Task calling a Python stored procedure (Snowpark) that fetches CoinGecko and appends straight into `CRYPTO_DB.STG.COINGECKO_RAW`. It requires an **External Access Integration** for network egress to `api.coingecko.com`, and creating one needs the global `CREATE INTEGRATION` privilege — which is not available on the Snowflake trial account this project was built against. Rather than delete the work, the file stays in the repo with its SQL commented out, and is **not** included in `infra-deploy.yml`'s applied-file list, so it has zero effect on the running pipeline. Production ingestion is 3a (`de-ingest.yml`, GitHub Actions cron) instead.
 
--- Fetches CoinGecko's top-50 markets and appends to the landing table.
--- Runs inside Snowflake's Python runtime (Snowpark) — same shape as
--- ingest_coingecko.py's fetch_coins()/build_rows(), reimplemented as a
--- stored procedure since it can't import the local ingestion/ package.
-CREATE OR REPLACE PROCEDURE CRYPTO_DB.STG.INGEST_COINGECKO()
-  RETURNS STRING
-  LANGUAGE PYTHON
-  RUNTIME_VERSION = '3.11'
-  PACKAGES = ('snowflake-snowpark-python', 'requests')
-  HANDLER = 'run'
-  EXTERNAL_ACCESS_INTEGRATIONS = (COINGECKO_ACCESS_INTEGRATION)
-AS
-$$
-import requests
-from datetime import datetime, timezone
+The full commented-out file is at [`snowflake/ingest_task.sql`](../de-pipeline/snowflake/ingest_task.sql); its header documents the exact steps to re-enable it (create the network rule + integration + `USAGE` grant as `ACCOUNTADMIN`, uncomment the body, add it to `run_sql.py`'s file list in `infra-deploy.yml`, and decide whether to retire `de-ingest.yml` so the two don't double-insert).
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
-PARAMS = {
-    "vs_currency": "usd",
-    "order": "market_cap_desc",
-    "per_page": 50,
-    "page": 1,
-    "sparkline": False,
-}
-
-COLUMNS = [
-    "id", "symbol", "name", "current_price", "market_cap", "total_volume",
-    "price_change_24h", "price_change_pct_24h", "high_24h", "low_24h",
-    "circulating_supply", "ath", "fetched_at",
-]
-
-def run(session):
-    resp = requests.get(COINGECKO_URL, params=PARAMS, timeout=30)
-    resp.raise_for_status()
-    coins = resp.json()
-    fetched_at = datetime.now(timezone.utc).isoformat()
-
-    rows = [
-        (
-            c["id"], c["symbol"], c["name"],
-            c.get("current_price"), c.get("market_cap"), c.get("total_volume"),
-            c.get("price_change_24h"), c.get("price_change_percentage_24h"),
-            c.get("high_24h"), c.get("low_24h"),
-            c.get("circulating_supply"), c.get("ath"), fetched_at,
-        )
-        for c in coins
-    ]
-
-    session.create_dataframe(rows, schema=COLUMNS) \
-        .write.save_as_table("CRYPTO_DB.STG.COINGECKO_RAW", mode="append")
-
-    return f"Loaded {len(rows)} rows at {fetched_at}"
-$$;
-
--- Runs the procedure hourly on the same warehouse as everything else.
-CREATE TASK IF NOT EXISTS CRYPTO_DB.STG.TASK_INGEST_COINGECKO
-  WAREHOUSE = CRYPTO_WH
-  SCHEDULE  = '60 MINUTE'
-AS
-  CALL CRYPTO_DB.STG.INGEST_COINGECKO();
-
-ALTER TASK CRYPTO_DB.STG.TASK_INGEST_COINGECKO RESUME;
-```
-
-Rows this task appends still flow through the existing `STREAM_COINGECKO_RAW` / `TASK_NOTIFY_NEW_DATA` from Step 2 unchanged — that stream tracks inserts on the table regardless of what inserted them, so nothing there needs to change.
+If it's ever re-enabled, rows it appends would still flow through the existing `STREAM_COINGECKO_RAW` / `TASK_NOTIFY_NEW_DATA` from Step 2 unchanged — that stream tracks inserts on the table regardless of what inserted them.
 
 ---
 
-## Deployment Step-1 — CI/CD for the Snowflake infra scripts (Steps 1–3b)
+## Deployment Step-1 — CI/CD for the Snowflake infra scripts (Steps 1–2)
 
-`infra-ci.yml` / `infra-deploy.yml` deploy **only** `snowflake/setup.sql`, `streams.sql`, `tasks.sql`, and `ingest_task.sql` — everything created in Steps 1, 2, and 3b, including production ingestion now that it's a Snowflake Task rather than an externally-scheduled script. This is separate from `de-ci.yml` / `de-deploy.yml` (Step 5), which now handle **dbt only**. Splitting them means an infra/ingestion change (e.g. a new schema, or editing the ingestion procedure) and a dbt change (e.g. a new mart) trigger independent, correctly-scoped pipelines.
+`infra-ci.yml` / `infra-deploy.yml` deploy **only** `snowflake/setup.sql`, `streams.sql`, and `tasks.sql` — the infra created in Steps 1–2. `ingest_task.sql` (Step 3b) is deliberately **not** in this list — it's disabled (see 3b), and its SQL is fully commented out, so there's nothing for `infra-deploy.yml` to apply. This is separate from `de-ci.yml` / `de-deploy.yml` (Step 5, dbt) and `de-ingest.yml` (Step 3a, ingestion). Splitting them means an infra change (e.g. a new schema), a dbt change (e.g. a new mart), and an ingestion change each trigger independent, correctly-scoped pipelines.
 
 - **CI does not touch real Snowflake.** It runs `sqlfluff parse` against the SQL — a genuine syntax check (catches malformed DDL) without needing credentials in a PR context, which matters once forks can open PRs.
 - **Deploy actually applies the SQL to Snowflake**, using the `DEVELOPER_SVC` key-pair service account from `README.md` (`SYSADMIN` + `USERADMIN`) via a small connector script, since GitHub's `ubuntu-latest` runners don't ship SnowSQL.
-- All four scripts are safe to re-run: `setup.sql`/`ingest_task.sql` use `CREATE ... IF NOT EXISTS` throughout, and `streams.sql` was changed from `CREATE OR REPLACE STREAM` to `CREATE STREAM IF NOT EXISTS` specifically so repeat deploys don't reset the stream's tracked offset.
-- `ingest_task.sql` additionally depends on two one-time `ACCOUNTADMIN` actions documented in `README.md`, neither of which `infra-deploy.yml` ever performs itself: the `EXECUTE TASK` grant (README 1.2, needed for *any* task `SYSADMIN` owns) and the network rule + External Access Integration + `USAGE` grant (README 1.5). Run those manually first, then `infra-deploy.yml` handles `ingest_task.sql` like any other file.
+- All three scripts are safe to re-run: `setup.sql` uses `CREATE ... IF NOT EXISTS` throughout, and `streams.sql` was changed from `CREATE OR REPLACE STREAM` to `CREATE STREAM IF NOT EXISTS` specifically so repeat deploys don't reset the stream's tracked offset.
+- If Step 3b is ever re-enabled, add `ingest_task.sql` back to the `run_sql.py` file list below — but only after its `ACCOUNTADMIN` prerequisites exist, or `CREATE PROCEDURE` will fail every deploy (it references an integration that must already exist at creation time).
 
 ### `run_sql.py` — applies SQL files via key-pair auth
 
@@ -670,7 +612,7 @@ on:
 
 jobs:
   deploy-snowflake-infra:
-    name: Apply setup.sql, streams.sql, tasks.sql, ingest_task.sql
+    name: Apply setup.sql, streams.sql, tasks.sql
     runs-on: ubuntu-latest
     environment: infra   # configure required reviewers: Settings -> Environments -> infra
     steps:
@@ -685,7 +627,7 @@ jobs:
 
       - name: Apply Snowflake infra
         working-directory: de-pipeline/snowflake
-        run: python run_sql.py setup.sql streams.sql tasks.sql ingest_task.sql
+        run: python run_sql.py setup.sql streams.sql tasks.sql
         env:
           SNOWFLAKE_ACCOUNT:             ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_DEV_SVC_USER:        ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
@@ -978,7 +920,7 @@ FROM {{ ref('stg_crypto_prices') }}
 
 Promotion between environments is driven purely by the dbt `--target` flag against the **same** models — dev, qa, and prod run identical SQL against different databases. `qa` and `prod` are wired as [GitHub Environments](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment) so you can require manual approval before either promotion runs.
 
-`de-ci.yml`/`de-deploy.yml` no longer touch ingestion at all — production ingestion is the Snowflake Task from Step 3b, deployed by `infra-deploy.yml` (Deployment Step-1), not by this pipeline. `ingestion/**` was dropped from the path filter below for the same reason: changes to the local-testing script don't need to trigger a dbt build.
+Ingestion is **not** part of this pipeline — it's its own workflow, `de-ingest.yml` (Step 3a), on an independent schedule. `de-ci.yml`/`de-deploy.yml` here cover dbt only, so their path filters watch `dbt/**` alone.
 
 ### CI — runs on every pull request (validates against dev_db)
 
@@ -1020,15 +962,15 @@ jobs:
 
 ### Deploy — promote dev_db → qa_db → prod_db
 
-Ingestion is no longer a job in this workflow — `CRYPTO_DB.STG.COINGECKO_RAW` is populated independently by the Snowflake Task from Step 3b on its own hourly schedule. This workflow only needs to run dbt often enough to pick up whatever's landed since the last run; the daily cron below is unrelated to (and no longer waits on) the ingestion cadence.
+Runs daily at **8:30 AM Bangkok time** — `1:30 AM UTC`, staggered 30 minutes after `de-ingest.yml`'s 8:00 AM run so the day's fresh rows have already landed in `CRYPTO_DB.STG` before dbt builds on top of them. It also runs on every merge to `main` (to deploy model changes) and via the manual button. Because the two workflows are separate, this is a loose time-based coupling, not a hard dependency — if ingestion is late or fails, dbt still runs against whatever data is currently in the landing table (incremental models simply pick up less new data that day).
 
 ```yaml
 # .github/workflows/de-deploy.yml
-name: Daily pipeline
+name: dbt promote
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 6:00 AM UTC every day
+    - cron: '30 1 * * *'   # 1:30 AM UTC = 8:30 AM Bangkok, 30 min after de-ingest.yml
   push:
     branches: [main]       # also triggers on merge to main
   workflow_dispatch:        # manual run button
@@ -1101,15 +1043,13 @@ jobs:
 
 | Secret name | Used by | Example value |
 |---|---|---|
-| `SNOWFLAKE_ACCOUNT` | both | `xy12345.us-east-1` |
-| `SNOWFLAKE_USER` | de-ci.yml / de-deploy.yml (dbt) | `pipeline_svc` (has `CRYPTO_PIPELINE_ROLE`) |
-| `SNOWFLAKE_PASSWORD` | de-ci.yml / de-deploy.yml (dbt) | your service account password |
+| `SNOWFLAKE_ACCOUNT` | all | `xy12345.us-east-1` |
+| `SNOWFLAKE_USER` | de-ingest.yml / de-ci.yml / de-deploy.yml | `pipeline_svc` (has `CRYPTO_PIPELINE_ROLE`) |
+| `SNOWFLAKE_PASSWORD` | de-ingest.yml / de-ci.yml / de-deploy.yml | your service account password |
 | `SNOWFLAKE_DEV_SVC_USER` | infra-deploy.yml | `DEVELOPER_SVC` |
 | `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` | infra-deploy.yml | full contents of `.keys/rsa_key.p8` |
 
-Production ingestion (Step 3b) needs none of these — it runs as a Snowflake Task authenticating with whatever role owns it, not via GitHub Actions.
-
-`SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` are the `DEVELOPER_SVC` key-pair account from `README.md` (`SYSADMIN` + `USERADMIN`) — deliberately separate from `SNOWFLAKE_USER`/`SNOWFLAKE_PASSWORD`, which only has `CRYPTO_PIPELINE_ROLE`'s narrower data-plane grants.
+`SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` are the `DEVELOPER_SVC` key-pair account from `README.md` (`SYSADMIN` + `USERADMIN`) — deliberately separate from `SNOWFLAKE_USER`/`SNOWFLAKE_PASSWORD`, which only has `CRYPTO_PIPELINE_ROLE`'s narrower data-plane grants and is what `de-ingest.yml` (ingestion) and the dbt workflows all authenticate with (`config.py` and dbt's `profiles.yml` read the same three env vars).
 
 **Environments** — Go to **GitHub repo → Settings → Environments** and create `infra`, `qa`, and `prod`. Add required reviewers on each to gate, respectively: applying infra changes to Snowflake, promotion out of dev, and promotion out of qa.
 
@@ -1117,17 +1057,19 @@ Production ingestion (Step 3b) needs none of these — it runs as a Snowflake Ta
 
 ## Pipeline execution flow
 
-Two independent schedules now, deliberately decoupled — ingestion no longer gates dbt:
+Ingestion and dbt promotion are two independent workflows on staggered daily schedules:
 
 ```
-Inside Snowflake, every 60 minutes (TASK_INGEST_COINGECKO, Step 3b)
+08:00 Bangkok / 01:00 UTC daily (cron) OR manual dispatch — de-ingest.yml (Step 3a)
 │
-└── CALL CRYPTO_DB.STG.INGEST_COINGECKO()
-      └── 50 rows → CRYPTO_DB.STG.COINGECKO_RAW
-            └── STREAM_COINGECKO_RAW captures new rows
-                  └── TASK_NOTIFY_NEW_DATA fires (signal only)
+└── Job: ingest
+      └── ingest_coingecko.py runs (INGEST_MODE=snowflake)
+            └── 50 rows → CRYPTO_DB.STG.COINGECKO_RAW
+                  └── STREAM_COINGECKO_RAW captures new rows
+                        └── TASK_NOTIFY_NEW_DATA fires (signal only)
 
-06:00 UTC daily (cron) OR push to main OR manual dispatch — de-deploy.yml (Step 5)
+08:30 Bangkok / 01:30 UTC daily (cron) OR push to main OR manual dispatch — de-deploy.yml (Step 5)
+│   (staggered 30 min after ingestion so the day's rows have landed)
 │
 ├── Job 1: deploy-dev
 │     └── dbt build --target dev
@@ -1146,7 +1088,7 @@ Inside Snowflake, every 60 minutes (TASK_INGEST_COINGECKO, Step 3b)
       └── dbt test      → all schema tests must pass or job fails
 ```
 
-Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.yml` (Deployment Step-1) independently, applying `setup.sql`/`streams.sql`/`tasks.sql`/`ingest_task.sql` — including any edit to the ingestion procedure or its schedule.
+Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.yml` (Deployment Step-1) independently, applying `setup.sql`/`streams.sql`/`tasks.sql`. `ingest_task.sql` (Step 3b) is excluded — it's disabled and has no effect until re-enabled.
 
 ---
 
@@ -1162,14 +1104,12 @@ Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.
 
 **Append-only landing table.** Raw data in `CRYPTO_DB.STG.COINGECKO_RAW` is never modified — every run appends rows with `fetched_at`. This gives a complete audit trail and lets you rebuild Silver/Gold in any environment from any past point in time.
 
-**Production ingestion is a Snowflake Task, not an external script.** `ingest_coingecko.py` (Step 3a) stays purely as a local reference/testing tool — nothing schedules or deploys it. Production ingestion (Step 3b) is a Python stored procedure on a Snowflake Task instead: one fewer system to host and monitor, no external secret to rotate for the CoinGecko call (the task runs as whichever role owns it), and the schedule lives next to the data it populates. The tradeoff is Snowflake-side setup: an External Access Integration for network egress, Python packages limited to what's on the Snowflake Anaconda channel, and two manual, one-time `ACCOUNTADMIN` steps (README 1.2/1.4) that are deliberately kept out of `infra-deploy.yml` rather than granted to `SYSADMIN` — see the `ACCOUNTADMIN` callouts in Step 3b.
+**Production ingestion runs via GitHub Actions, not a Snowflake Task — for now.** A Snowflake-native Python Task (Step 3b, `ingest_task.sql`) was built and is kept in the repo, but it needs an External Access Integration, which requires the `CREATE INTEGRATION` privilege — unavailable on the Snowflake trial account this project runs on. Rather than block on that, ingestion reverted to `ingest_coingecko.py`. `ingest_task.sql`'s SQL is fully commented out and excluded from `infra-deploy.yml`'s file list, so it has zero effect until the account is upgraded and someone deliberately re-enables it (instructions are in Step 3b's comment header).
 
-**Ingestion and dbt promotion are decoupled schedules.** The Snowflake Task runs hourly regardless of whether `de-deploy.yml` has run; `de-deploy.yml` runs on its own daily cron and just picks up whatever has landed since its last run. Neither waits on the other — there's no `needs: ingest` anymore because ingestion isn't a GitHub Actions job at all.
+**Ingestion is a standalone workflow, decoupled from dbt promotion.** `de-ingest.yml` (Step 3a) runs `ingest_coingecko.py` on its own daily cron; `de-deploy.yml` (Step 5) runs dbt on a separate cron staggered 30 minutes later. Splitting them — rather than making ingestion a first job inside `de-deploy.yml` — means each can be retried, rerun, and read in isolation, and a flaky data pull doesn't show up as a "deploy" failure. The tradeoff is there's no hard `needs:` ordering across the two workflows (GitHub Actions can't express that cleanly); the 30-minute stagger is a deliberately loose coupling, and because Silver is incremental, a missed or late ingestion just means that day's dbt run merges fewer new rows rather than breaking.
 
 **Snowflake Stream as a zero-cost trigger.** `APPEND_ONLY = TRUE` on the stream means Snowflake only tracks inserts, the cheapest change-tracking mode. `SYSTEM$STREAM_HAS_DATA` prevents the Task from consuming credits when there's nothing new — it exists purely as a monitoring signal, since the real Silver/Gold builds run through dbt.
 
 **GitHub Environments gate qa/prod promotion.** `deploy-qa` and `deploy-prod` are tied to GitHub `environment: qa` / `environment: prod`, so promotion out of dev (and out of qa) can require manual reviewer approval without adding any custom logic to the workflow.
 
 **`state:modified+` in CI.** The CI workflow only builds models that changed in the PR plus their downstream dependencies, against `dev_db` — making CI runs fast, cheap, and safe to iterate on without touching qa/prod.
-
-**`needs:` chain in deploy.yml.** `deploy-qa` waits on `deploy-dev`, `deploy-prod` waits on `deploy-qa`. If a dbt build or test fails at any stage, nothing downstream is promoted on broken data.

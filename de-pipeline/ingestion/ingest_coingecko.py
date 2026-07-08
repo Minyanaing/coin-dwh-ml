@@ -8,10 +8,13 @@ import snowflake.connector
 import config
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
+# Fetch only the curated set from config (top coins + stablecoins) via the
+# `ids` param, rather than the top N by market cap.
 PARAMS = {
     "vs_currency": "usd",
+    "ids": ",".join(config.COIN_IDS),
     "order": "market_cap_desc",
-    "per_page": 50,
+    "per_page": len(config.COIN_IDS),
     "page": 1,
     "sparkline": False,
 }
