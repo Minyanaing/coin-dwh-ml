@@ -26,11 +26,14 @@ Raw ingestion always lands in `CRYPTO_DB.STG` — there is only ever one copy of
 ## Folder structure
 
 ```
-crypto-pipeline/
+coin-dwh-ml/
+├── .sqlfluff                        # dialect=snowflake, used by infra-ci.yml
 ├── .github/
 │   └── workflows/
-│       ├── de-ci.yml               # PR: dbt build + test against dev_db
-│       └── de-deploy.yml           # ingest, then promote dev_db -> qa_db -> prod_db
+│       ├── infra-ci.yml             # PR: sqlfluff syntax check on snowflake/**
+│       ├── infra-deploy.yml         # merge to main: apply setup/streams/tasks to Snowflake
+│       ├── de-ci.yml                # PR: dbt build + test against dev_db
+│       └── de-deploy.yml            # ingest, then promote dev_db -> qa_db -> prod_db
 └── de-pipeline/
     ├── ingestion/
     │   ├── ingest_coingecko.py      # main ingestion script (local CSV or Snowflake)
@@ -62,10 +65,17 @@ crypto-pipeline/
     ├── snowflake/
     │   ├── setup.sql                # warehouses, databases, roles, schemas
     │   ├── streams.sql              # Snowflake Stream definition
-    │   └── tasks.sql                # Snowflake Task (new-data signal)
+    │   ├── tasks.sql                # Snowflake Task (new-data signal)
+    │   ├── run_sql.py               # applies *.sql via key-pair auth (used by infra-deploy.yml)
+    │   └── requirements.txt         # snowflake-connector-python, cryptography
+    ├── .keys/                       # gitignored — local rsa_key.p8 / rsa_key.pub
     └── README.md
 ```
 
+---
+Update README.md file
+- instruct to create a service account to use for the developement using KEY-PAIR. Give permission for SYSADMIN and USERADMIN
+- how to setup python locally and run the ingestion locally. Local instructions must be for windows 11 CMD and linux/mac
 ---
 
 ## Step 1 — Snowflake setup
@@ -169,9 +179,12 @@ A single Stream/Task pair lives on the shared landing table — it only signals 
 
 ```sql
 -- snowflake/streams.sql
+-- IF NOT EXISTS (not OR REPLACE) — this script re-runs on every infra
+-- deploy, and CREATE OR REPLACE STREAM would reset the tracked offset,
+-- silently re-surfacing already-consumed rows as "new" every deploy.
 
 -- Captures every new INSERT on the raw landing table
-CREATE OR REPLACE STREAM CRYPTO_DB.STG.STREAM_COINGECKO_RAW
+CREATE STREAM IF NOT EXISTS CRYPTO_DB.STG.STREAM_COINGECKO_RAW
   ON TABLE CRYPTO_DB.STG.COINGECKO_RAW
   APPEND_ONLY = TRUE;
 ```
@@ -284,7 +297,7 @@ def build_rows(coins: list, fetched_at: str) -> list[dict]:
 
 def save_to_csv(rows: list[dict], fetched_at: str) -> str:
     os.makedirs(config.CSV_OUTPUT_DIR, exist_ok=True)
-    stamp = fetched_at.replace(":", "").replace("-", "").replace("+00:00", "Z")
+    stamp = fetched_at.replace("+00:00", "Z").replace(":", "").replace("-", "")
     path = os.path.join(config.CSV_OUTPUT_DIR, f"coingecko_raw_{stamp}.csv")
 
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -345,22 +358,22 @@ if __name__ == "__main__":
 ```
 # ingestion/requirements.txt
 requests==2.31.0
-snowflake-connector-python==3.6.0
+snowflake-connector-python==3.13.2
 python-dotenv==1.0.1
 ```
 
 ### Local virtual environment & testing
 
-```powershell
-# from repo root, PowerShell
+```cmd
+:: Windows cmd, from repo root
 cd de-pipeline
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.venv\Scripts\activate.bat
 pip install -r ingestion\requirements.txt
 ```
 
 ```bash
-# macOS/Linux/bash equivalent
+# Linux / macOS
 cd de-pipeline
 python -m venv .venv
 source .venv/bin/activate
@@ -369,13 +382,17 @@ pip install -r ingestion/requirements.txt
 
 Run in local mode first — no Snowflake credentials needed, output lands in `ingestion/data/coingecko_raw_<timestamp>.csv`:
 
-```powershell
+```cmd
 python ingestion\ingest_coingecko.py
+```
+
+```bash
+python ingestion/ingest_coingecko.py
 ```
 
 Once the CSV looks correct, switch to Snowflake mode by setting `INGEST_MODE=snowflake` plus credentials (either export env vars or drop them in `ingestion/.env`, which `config.py` loads automatically via `python-dotenv`):
 
-```powershell
+```
 # ingestion/.env (gitignored — never commit)
 INGEST_MODE=snowflake
 SNOWFLAKE_ACCOUNT=xy12345.us-east-1
@@ -383,11 +400,186 @@ SNOWFLAKE_USER=pipeline_svc
 SNOWFLAKE_PASSWORD=********
 ```
 
-```powershell
+```cmd
 python ingestion\ingest_coingecko.py
 ```
 
+```bash
+python ingestion/ingest_coingecko.py
+```
+
 Add `.venv/`, `ingestion/data/`, and `ingestion/.env` to `.gitignore` — none of them should be committed.
+
+---
+
+## Deployment Step-1 — CI/CD for the Snowflake infra scripts (Steps 1–2)
+
+`infra-ci.yml` / `infra-deploy.yml` deploy **only** `snowflake/setup.sql`, `streams.sql`, and `tasks.sql` — the infra created in Steps 1–2. This is separate from `de-ci.yml` / `de-deploy.yml` (Step 5), which handle ingestion + dbt. Splitting them means an infra change (e.g. a new schema) and a dbt change (e.g. a new mart) trigger independent, correctly-scoped pipelines.
+
+- **CI does not touch real Snowflake.** It runs `sqlfluff parse` against the SQL — a genuine syntax check (catches malformed DDL) without needing credentials in a PR context, which matters once forks can open PRs.
+- **Deploy actually applies the SQL to Snowflake**, using the `CRYPTO_DEV_SVC` key-pair service account from `README.md` (`SYSADMIN` + `USERADMIN`) via a small connector script, since GitHub's `ubuntu-latest` runners don't ship SnowSQL.
+- All three scripts are safe to re-run: `setup.sql` uses `CREATE ... IF NOT EXISTS` throughout, and `streams.sql` was changed from `CREATE OR REPLACE STREAM` to `CREATE STREAM IF NOT EXISTS` specifically so repeat deploys don't reset the stream's tracked offset.
+
+### `run_sql.py` — applies SQL files via key-pair auth
+
+```python
+# snowflake/run_sql.py
+import argparse
+import os
+import sys
+
+import snowflake.connector
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+
+
+def load_private_key_der(pem: str, passphrase: str | None) -> bytes:
+    key = serialization.load_pem_private_key(
+        pem.encode(),
+        password=passphrase.encode() if passphrase else None,
+        backend=default_backend(),
+    )
+    return key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def get_connection():
+    return snowflake.connector.connect(
+        account            = os.environ["SNOWFLAKE_ACCOUNT"],
+        user               = os.environ["SNOWFLAKE_DEV_SVC_USER"],
+        private_key        = load_private_key_der(
+            os.environ["SNOWFLAKE_DEV_SVC_PRIVATE_KEY"],
+            os.environ.get("SNOWFLAKE_DEV_SVC_PRIVATE_KEY_PASSPHRASE"),
+        ),
+        warehouse          = os.environ.get("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH"),
+    )
+
+
+def run_file(cur, path: str) -> None:
+    with open(path, "r", encoding="utf-8") as f:
+        sql = f.read()
+
+    statements = [s.strip() for s in sql.split(";")]
+    for statement in statements:
+        if not statement:
+            continue
+        code_lines = [
+            line for line in statement.splitlines()
+            if line.strip() and not line.strip().startswith("--")
+        ]
+        preview = code_lines[0][:80] if code_lines else statement.splitlines()[0][:80]
+        print(f"  -> {preview}")
+        cur.execute(statement)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Apply Snowflake infra SQL files in order")
+    parser.add_argument("files", nargs="+", help="SQL files to run, in order")
+    args = parser.parse_args()
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        for path in args.files:
+            print(f"=== Running {path} ===")
+            run_file(cur, path)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+```
+# snowflake/requirements.txt
+snowflake-connector-python==3.13.2
+cryptography==42.0.5
+```
+
+### CI — syntax-check on every pull request
+
+```yaml
+# .github/workflows/infra-ci.yml
+name: Infra CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'de-pipeline/snowflake/**'
+
+jobs:
+  sql-syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install sqlfluff
+        run: pip install sqlfluff==3.1.1
+
+      # Parse-only, not lint: this catches real syntax errors without
+      # requiring Snowflake credentials in a PR context (safer for forks)
+      # and without forcing a specific formatting style on the DDL.
+      - name: Validate Snowflake SQL syntax
+        run: sqlfluff parse de-pipeline/snowflake --dialect snowflake
+```
+
+`.sqlfluff` at the repo root pins the dialect so both this workflow and local runs agree:
+
+```ini
+[sqlfluff]
+dialect = snowflake
+templater = raw
+```
+
+### Deploy — apply to Snowflake on merge to main
+
+```yaml
+# .github/workflows/infra-deploy.yml
+name: Infra Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'de-pipeline/snowflake/**'
+  workflow_dispatch:
+
+jobs:
+  deploy-snowflake-infra:
+    name: Apply setup.sql, streams.sql, tasks.sql
+    runs-on: ubuntu-latest
+    environment: infra   # configure required reviewers: Settings -> Environments -> infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r de-pipeline/snowflake/requirements.txt
+
+      - name: Apply Snowflake infra
+        working-directory: de-pipeline/snowflake
+        run: python run_sql.py setup.sql streams.sql tasks.sql
+        env:
+          SNOWFLAKE_ACCOUNT:             ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DEV_SVC_USER:        ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
+          SNOWFLAKE_DEV_SVC_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+```
+
+`environment: infra` gates this the same way `qa`/`prod` are gated in `de-deploy.yml` (Step 5) — add required reviewers under **Settings → Environments → infra** if infra changes should need manual approval before hitting Snowflake.
+
+New secrets needed (see updated Step 6): `SNOWFLAKE_DEV_SVC_USER` and `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` hold the `CRYPTO_DEV_SVC` key-pair credentials from `README.md` — the contents of `.keys/rsa_key.p8`, not the `CRYPTO_PIPELINE_ROLE` password used by `de-deploy.yml`. These are different accounts with different privileges (`SYSADMIN`/`USERADMIN` for infra vs. `CRYPTO_PIPELINE_ROLE` for data) and should stay separate.
 
 ---
 
@@ -805,13 +997,17 @@ jobs:
 
 **Secrets** — Go to **GitHub repo → Settings → Secrets and variables → Actions → New repository secret**
 
-| Secret name | Example value |
-|---|---|
-| `SNOWFLAKE_ACCOUNT` | `xy12345.us-east-1` |
-| `SNOWFLAKE_USER` | `pipeline_svc` |
-| `SNOWFLAKE_PASSWORD` | your service account password |
+| Secret name | Used by | Example value |
+|---|---|---|
+| `SNOWFLAKE_ACCOUNT` | both | `xy12345.us-east-1` |
+| `SNOWFLAKE_USER` | de-deploy.yml | `pipeline_svc` (has `CRYPTO_PIPELINE_ROLE`) |
+| `SNOWFLAKE_PASSWORD` | de-deploy.yml | your service account password |
+| `SNOWFLAKE_DEV_SVC_USER` | infra-deploy.yml | `CRYPTO_DEV_SVC` |
+| `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` | infra-deploy.yml | full contents of `.keys/rsa_key.p8` |
 
-**Environments** — Go to **GitHub repo → Settings → Environments** and create `qa` and `prod`. Add required reviewers on each to gate promotion out of dev and out of qa respectively.
+`SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` are the `CRYPTO_DEV_SVC` key-pair account from `README.md` (`SYSADMIN` + `USERADMIN`) — deliberately separate from `SNOWFLAKE_USER`/`SNOWFLAKE_PASSWORD`, which only has `CRYPTO_PIPELINE_ROLE`'s narrower data-plane grants.
+
+**Environments** — Go to **GitHub repo → Settings → Environments** and create `infra`, `qa`, and `prod`. Add required reviewers on each to gate, respectively: applying infra changes to Snowflake, promotion out of dev, and promotion out of qa.
 
 ---
 
