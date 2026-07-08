@@ -27,7 +27,10 @@ jobs:
         working-directory: de-pipeline/ingestion
         run: python ingest_coingecko.py
         env:
-          INGEST_MODE:        snowflake
-          SNOWFLAKE_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER:     ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          INGEST_MODE:         snowflake
+          # Reuse the DEVELOPER_SVC key pair (TYPE=SERVICE -> key-pair auth only).
+          # Its usable role is SYSADMIN, which owns CRYPTO_DB.STG.
+          SNOWFLAKE_ACCOUNT:     ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:        ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+          SNOWFLAKE_ROLE:        SYSADMIN

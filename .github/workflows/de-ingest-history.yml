@@ -37,6 +37,9 @@ jobs:
           # Set the COINGECKO_API_KEY secret and COINGECKO_API_PLAN var (=pro) to use it.
           COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_PLAN: ${{ vars.COINGECKO_API_PLAN || 'demo' }}
-          SNOWFLAKE_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER:     ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          # Reuse the DEVELOPER_SVC key pair (TYPE=SERVICE -> key-pair auth only).
+          # Its usable role is SYSADMIN, which owns CRYPTO_DB.STG.
+          SNOWFLAKE_ACCOUNT:     ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:        ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+          SNOWFLAKE_ROLE:        SYSADMIN

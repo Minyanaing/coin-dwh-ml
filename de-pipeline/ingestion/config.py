@@ -43,6 +43,18 @@ COINGECKO_API_PLAN = os.getenv("COINGECKO_API_PLAN", "demo")  # "demo" or "pro"
 SNOWFLAKE_ACCOUNT   = os.getenv("SNOWFLAKE_ACCOUNT")
 SNOWFLAKE_USER      = os.getenv("SNOWFLAKE_USER")
 SNOWFLAKE_PASSWORD  = os.getenv("SNOWFLAKE_PASSWORD")
+
+# Key-pair auth (used by CI, which reuses the DEVELOPER_SVC key pair). Provide
+# EITHER an inline PEM (SNOWFLAKE_PRIVATE_KEY, how GitHub Actions passes the
+# secret) OR a path to a .p8 file (SNOWFLAKE_PRIVATE_KEY_PATH, nicer locally).
+# If neither is set, get_snowflake_conn() falls back to SNOWFLAKE_PASSWORD.
+SNOWFLAKE_PRIVATE_KEY            = os.getenv("SNOWFLAKE_PRIVATE_KEY")
+SNOWFLAKE_PRIVATE_KEY_PATH       = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+SNOWFLAKE_PRIVATE_KEY_PASSPHRASE = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+
+# DEVELOPER_SVC's usable role is SYSADMIN (it does not hold CRYPTO_PIPELINE_ROLE),
+# so CI overrides SNOWFLAKE_ROLE=SYSADMIN. SYSADMIN owns CRYPTO_DB.STG and can
+# insert into the landing tables.
 SNOWFLAKE_ROLE      = os.getenv("SNOWFLAKE_ROLE", "CRYPTO_PIPELINE_ROLE")
 SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH")
 SNOWFLAKE_DATABASE  = os.getenv("SNOWFLAKE_DATABASE", "CRYPTO_DB")

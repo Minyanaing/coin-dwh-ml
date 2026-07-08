@@ -59,11 +59,17 @@ GRANT ROLE USERADMIN TO USER DEVELOPER_SVC;  -- create/manage CRYPTO_PIPELINE_RO
 -- (streams.sql/tasks.sql from Step 2, ingest_task.sql from Step 3b) —
 -- EXECUTE TASK is a global privilege only ACCOUNTADMIN holds by default.
 GRANT EXECUTE TASK ON ACCOUNT TO ROLE SYSADMIN;
+
+-- Without this, setup.sql's `GRANT ... ON FUTURE TABLES/SCHEMAS/VIEWS ...`
+-- statements fail with "Insufficient privileges ... must have MANAGE GRANTS".
+-- Owning an object lets SYSADMIN grant on EXISTING objects, but FUTURE grants
+-- specifically require MANAGE GRANTS, which only ACCOUNTADMIN holds by default.
+GRANT MANAGE GRANTS ON ACCOUNT TO ROLE SYSADMIN;
 ```
 
 `TYPE = SERVICE` marks this as a non-human/programmatic account — Snowflake blocks password-based login for it entirely (key-pair or OAuth only), so there's no interactive-login credential to leak or rotate, which fits an account that only ever authenticates from `infra-deploy.yml`.
 
-Snowflake splits these privileges across two built-in roles — `SYSADMIN` cannot run `CREATE ROLE` on its own, and `USERADMIN` cannot create warehouses/databases — so the dev account needs both. `snowflake/setup.sql` switches between them itself (`USE ROLE SYSADMIN` / `USE ROLE USERADMIN`) as it creates each kind of object. `EXECUTE TASK` is a separate global privilege from either of those — without it, any `ALTER TASK ... RESUME` run as `SYSADMIN` fails, so it's granted here once rather than being rediscovered as a bug later.
+Snowflake splits these privileges across two built-in roles — `SYSADMIN` cannot run `CREATE ROLE` on its own, and `USERADMIN` cannot create warehouses/databases — so the dev account needs both. `snowflake/setup.sql` switches between them itself (`USE ROLE SYSADMIN` / `USE ROLE USERADMIN`) as it creates each kind of object. `EXECUTE TASK` and `MANAGE GRANTS` are separate account-level privileges neither built-in role holds by default: without `EXECUTE TASK`, any `ALTER TASK ... RESUME` as `SYSADMIN` fails; without `MANAGE GRANTS`, setup.sql's `GRANT ... ON FUTURE ...` statements fail. Both are granted here once so they're not rediscovered as failed deploys later.
 
 ### 1.3 Wire the service account into GitHub Actions (`infra-deploy.yml`)
 

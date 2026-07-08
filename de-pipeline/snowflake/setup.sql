@@ -4,6 +4,9 @@
 -- The script switches roles itself: SYSADMIN owns warehouses/databases/
 -- schemas/tables, USERADMIN owns role creation — SYSADMIN alone cannot
 -- run CREATE ROLE.
+-- Prerequisite: SYSADMIN must also hold MANAGE GRANTS (one-time ACCOUNTADMIN
+-- grant, see README 1.2) — the GRANT ... ON FUTURE statements below fail
+-- without it, even though SYSADMIN owns the databases.
 
 USE ROLE SYSADMIN;
 
