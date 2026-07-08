@@ -404,7 +404,7 @@ Once the CSV looks correct, switch to Snowflake mode by setting `INGEST_MODE=sno
 # ingestion/.env (gitignored — never commit)
 INGEST_MODE=snowflake
 SNOWFLAKE_ACCOUNT=xy12345.us-east-1
-SNOWFLAKE_USER=pipeline_svc
+SNOWFLAKE_USER=DEVELOPER_SVC
 SNOWFLAKE_PASSWORD=********
 ```
 

@@ -18,4 +18,4 @@ de-pipeline/dbt/dbt_packages/
 de-pipeline/dbt/logs/
 
 # github action
-.github/
+# .github/

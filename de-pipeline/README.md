@@ -48,7 +48,6 @@ CREATE USER IF NOT EXISTS DEVELOPER_SVC
   RSA_PUBLIC_KEY = '<contents of rsa_key.pub>'
   DEFAULT_ROLE = SYSADMIN
   DEFAULT_WAREHOUSE = CRYPTO_WH
-  MUST_CHANGE_PASSWORD = FALSE
   COMMENT = 'Infra CI/CD service account key-pair auth';
 
 GRANT ROLE SYSADMIN  TO USER DEVELOPER_SVC;  -- create/manage warehouses, databases, schemas, tables

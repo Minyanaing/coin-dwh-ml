@@ -1,0 +1,33 @@
+name: Infra Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'de-pipeline/snowflake/**'
+  workflow_dispatch:
+
+jobs:
+  deploy-snowflake-infra:
+    name: Apply setup.sql, streams.sql, tasks.sql, ingest_task.sql
+    runs-on: ubuntu-latest
+    environment: infra   # configure required reviewers: Settings -> Environments -> infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r de-pipeline/snowflake/requirements.txt
+
+      # ingest_task.sql requires the one-time ACCOUNTADMIN setup in README.md
+      # (EXECUTE TASK grant + external access integration) to already exist.
+      - name: Apply Snowflake infra
+        working-directory: de-pipeline/snowflake
+        run: python run_sql.py setup.sql streams.sql tasks.sql ingest_task.sql
+        env:
+          SNOWFLAKE_ACCOUNT:             ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DEV_SVC_USER:        ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
+          SNOWFLAKE_DEV_SVC_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
