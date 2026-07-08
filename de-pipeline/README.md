@@ -7,7 +7,9 @@ Full design doc: [`../.claude/crypto-de-pipeline-project-plan.md`](../.claude/cr
 
 ## 1. Create a developer service account (key-pair auth)
 
-This account is for **infra setup** — applying `snowflake/setup.sql`, `streams.sql`, `tasks.sql`, and `ingest_task.sql`, all done automatically by `infra-deploy.yml` (section 1.3–1.4) rather than run by hand — not for the ingestion pipeline itself (that uses `CRYPTO_PIPELINE_ROLE`, created *by* this account). Key-pair authentication is used instead of a password so nothing secret ever needs to be typed into a SQL client or stored as a plaintext password.
+This account is for **infra setup** — applying `snowflake/setup.sql`, `streams.sql`, and `tasks.sql`, done automatically by `infra-deploy.yml` (section 1.3–1.4) rather than run by hand — not for the ingestion pipeline itself (that uses `CRYPTO_PIPELINE_ROLE`, created *by* this account, and runs on its own GitHub Actions schedule — see the project plan's Step 5). Key-pair authentication is used instead of a password so nothing secret ever needs to be typed into a SQL client or stored as a plaintext password.
+
+`snowflake/ingest_task.sql` also exists in the repo but is currently **disabled** (section 1.5) — it's not applied by `infra-deploy.yml`.
 
 ### 1.1 Generate an RSA key pair
 
@@ -65,7 +67,7 @@ Snowflake splits these privileges across two built-in roles — `SYSADMIN` canno
 
 ### 1.3 Wire the service account into GitHub Actions (`infra-deploy.yml`)
 
-`infra-deploy.yml` applies `setup.sql`/`streams.sql`/`tasks.sql`/`ingest_task.sql` automatically, authenticating as `DEVELOPER_SVC` — there's no need to run any of them by hand. Add two repository secrets (**Settings → Secrets and variables → Actions**):
+`infra-deploy.yml` applies `setup.sql`/`streams.sql`/`tasks.sql` automatically, authenticating as `DEVELOPER_SVC` — there's no need to run any of them by hand. (`ingest_task.sql` is excluded — see section 1.5.) Add two repository secrets (**Settings → Secrets and variables → Actions**):
 
 | Secret | Value |
 |---|---|
@@ -81,11 +83,9 @@ With the secrets above in place, either:
 - Push a change under `de-pipeline/snowflake/**` to `main`, or
 - Trigger it manually: **GitHub repo → Actions → Infra Deploy → Run workflow**
 
-This creates `CRYPTO_WH`, all four databases (`CRYPTO_DB`, `DEV_DB`, `QA_DB`, `PROD_DB`), their schemas, the raw landing table, and `CRYPTO_PIPELINE_ROLE` — the role dbt/CI use day-to-day. All four scripts are safe to re-run (`CREATE ... IF NOT EXISTS`), so repeat deploys are idempotent — no destructive drops or offset resets.
+This creates `CRYPTO_WH`, all four databases (`CRYPTO_DB`, `DEV_DB`, `QA_DB`, `PROD_DB`), their schemas, the raw landing table, and `CRYPTO_PIPELINE_ROLE` — the role dbt/CI use day-to-day. All three scripts are safe to re-run (`CREATE ... IF NOT EXISTS`), so repeat deploys are idempotent — no destructive drops or offset resets.
 
-**First run only:** the `ingest_task.sql` step will fail with an "integration does not exist" error — that's expected, since it depends on section 1.5 below, which hasn't run yet. `setup.sql`/`streams.sql`/`tasks.sql` still apply successfully before that failure; re-run the workflow after completing 1.5 and it picks up cleanly.
-
-Grant `CRYPTO_PIPELINE_ROLE` to whatever user your dbt/CI authenticates as:
+Grant `CRYPTO_PIPELINE_ROLE` to whatever user your ingestion / dbt / CI authenticates as (this is the `SNOWFLAKE_USER` secret used by `de-ingest.yml` and the dbt workflows alike — see the project plan's Step 6):
 
 ```sql
 GRANT ROLE CRYPTO_PIPELINE_ROLE TO USER <your_ingestion_user>;
@@ -128,31 +128,13 @@ snowsql -a <account_identifier> -u DEVELOPER_SVC \
 
 </details>
 
-### 1.5 One-time ACCOUNTADMIN setup for production ingestion (Snowflake Task)
+### 1.5 Snowflake Task ingestion — disabled on trial accounts
 
-Production ingestion (`snowflake/ingest_task.sql`) calls the CoinGecko API from *inside* Snowflake, which requires an **External Access Integration** — an account-level object. Creating one requires the global `CREATE INTEGRATION` privilege, which only `ACCOUNTADMIN` holds by default and which we deliberately do **not** grant to `DEVELOPER_SVC` / `SYSADMIN` (unlike `EXECUTE TASK` above, this is a rarely-changed, high-privilege capability better left as a manual, audited step than automated in CI).
+`snowflake/ingest_task.sql` is a from-inside-Snowflake alternative to the standalone `de-ingest.yml` GitHub Actions workflow (the project plan's Step 3a). It's **not in use** and **not applied** by `infra-deploy.yml` — skip this section unless you've upgraded off a Snowflake trial account.
 
-Run this once, manually, as `ACCOUNTADMIN` — **after** `setup.sql` has already run (section 1.4), since it creates an object inside `CRYPTO_DB.STG`:
+It would call the CoinGecko API from *inside* Snowflake, which needs an **External Access Integration** — an account-level object requiring the global `CREATE INTEGRATION` privilege. That privilege isn't available on a Snowflake trial account, so `ingest_task.sql`'s SQL is fully commented out in the repo rather than deleted. Production ingestion runs the GitHub Actions way instead (`ingest_coingecko.py` via `de-ingest.yml`, scheduled daily — see section 2 below).
 
-```sql
--- Run once as ACCOUNTADMIN, after snowflake/setup.sql has been applied
-
--- Egress allowlist: only CoinGecko's public REST API, nothing else
-CREATE NETWORK RULE IF NOT EXISTS CRYPTO_DB.STG.COINGECKO_NETWORK_RULE
-  MODE = EGRESS
-  TYPE = HOST_PORT
-  VALUE_LIST = ('api.coingecko.com');
-
-CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS COINGECKO_ACCESS_INTEGRATION
-  ALLOWED_NETWORK_RULES = (CRYPTO_DB.STG.COINGECKO_NETWORK_RULE)
-  ENABLED = TRUE;
-
--- SYSADMIN creates and owns the procedure/task in ingest_task.sql, and
--- needs USAGE on the integration to reference it in CREATE PROCEDURE.
-GRANT USAGE ON INTEGRATION COINGECKO_ACCESS_INTEGRATION TO ROLE SYSADMIN;
-```
-
-Once this exists, re-run `infra-deploy.yml` (push or manual trigger, same as 1.4) — `ingest_task.sql` now applies cleanly as ordinary `SYSADMIN` work. If you ever need to allow a different host, re-run the `CREATE NETWORK RULE` block manually; nothing in CI/CD can do that for you by design.
+If you later upgrade the Snowflake account and want to switch to Task-based ingestion, `ingest_task.sql`'s header comment has the exact steps: run the `ACCOUNTADMIN` network-rule/integration setup once, uncomment the file's contents, and add it back to `run_sql.py`'s file list in `infra-deploy.yml`. Decide at that point whether to keep the `de-ingest.yml` workflow running too — running both would double-insert rows.
 
 ---
 
@@ -190,9 +172,9 @@ python ingestion/ingest_coingecko.py
 
 Output: `ingestion/data/coingecko_raw_<timestamp>.csv` — open it and confirm the 50 rows of CoinGecko data look right.
 
-### 2.3 Switch to loading into Snowflake (manual verification only)
+### 2.3 Switch to loading into Snowflake
 
-This is for manually checking the write path against a dev schema by hand — it is **not** how production data gets loaded. Production ingestion runs on its own schedule as a Snowflake Task (`snowflake/ingest_task.sql`, see section 1.5); nothing ever runs this script automatically.
+This is the same mode `de-ingest.yml` runs in production, on a schedule — see the project plan's Step 3a for the actual GitHub Actions workflow (daily at 8AM Bangkok time / 1AM UTC). Running it here by hand first is how you verify the write path before trusting the scheduled job.
 
 Copy `ingestion/.env.example` to `ingestion/.env` (gitignored — never commit it) and fill in:
 

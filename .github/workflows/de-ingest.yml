@@ -1,0 +1,33 @@
+name: DE Ingest
+
+# Standalone data-ingestion workflow — deliberately separate from de-deploy.yml
+# (dbt promotion) so ingestion and transformation run on independent schedules
+# and can be triggered, retried, and reasoned about in isolation.
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 1:00 AM UTC = 8:00 AM Bangkok time (ICT, UTC+7, no DST)
+  workflow_dispatch:        # manual run button
+
+jobs:
+  ingest:
+    name: Ingest CoinGecko -> CRYPTO_DB.STG.COINGECKO_RAW
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r de-pipeline/ingestion/requirements.txt
+
+      - name: Run ingestion (INGEST_MODE=snowflake)
+        working-directory: de-pipeline/ingestion
+        run: python ingest_coingecko.py
+        env:
+          INGEST_MODE:        snowflake
+          SNOWFLAKE_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:     ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
