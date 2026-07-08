@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.keys/
+
+# Local ingestion secrets/output
+de-pipeline/ingestion/.env
+de-pipeline/ingestion/data/
+
+# Snowflake key-pair auth — never commit private keys
+de-pipeline/.keys/
+*.p8
+
+# dbt
+de-pipeline/dbt/target/
+de-pipeline/dbt/dbt_packages/
+de-pipeline/dbt/logs/
+
+# github action
+# .github/
