@@ -81,6 +81,10 @@ def fetch_history(coin_id: str, start_ts: int, end_ts: int) -> dict:
     return {}
 
 
+def _round5(value):
+    """Round numeric API values to 5 decimals; pass None through untouched."""
+    return round(value, 5) if value is not None else None
+
 def build_history_rows(coin: dict, payload: dict, fetched_at: str) -> list[dict]:
     def by_date(pairs):
         # CoinGecko returns [timestamp_ms, value]; collapse to one value per UTC day
@@ -101,9 +105,9 @@ def build_history_rows(coin: dict, payload: dict, fetched_at: str) -> list[dict]
             "symbol": coin["symbol"],
             "name": coin["name"],
             "price_date": day,
-            "price": prices.get(day),
-            "market_cap": market_caps.get(day),
-            "total_volume": total_volumes.get(day),
+            "price": _round5(prices.get(day)),
+            "market_cap": _round5(market_caps.get(day)),
+            "total_volume": _round5(total_volumes.get(day)),
             "fetched_at": fetched_at,
         }
         for day in sorted(prices)

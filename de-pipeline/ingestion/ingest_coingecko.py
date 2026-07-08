@@ -25,6 +25,10 @@ FIELDNAMES = [
     "circulating_supply", "ath", "fetched_at",
 ]
 
+def _round5(value):
+    """Round numeric API values to 5 decimals; pass None through untouched."""
+    return round(value, 5) if value is not None else None
+
 def fetch_coins():
     resp = requests.get(COINGECKO_URL, params=PARAMS, timeout=30)
     resp.raise_for_status()
@@ -36,15 +40,15 @@ def build_rows(coins: list, fetched_at: str) -> list[dict]:
             "id": c["id"],
             "symbol": c["symbol"],
             "name": c["name"],
-            "current_price": c.get("current_price"),
-            "market_cap": c.get("market_cap"),
-            "total_volume": c.get("total_volume"),
-            "price_change_24h": c.get("price_change_24h"),
-            "price_change_pct_24h": c.get("price_change_percentage_24h"),
-            "high_24h": c.get("high_24h"),
-            "low_24h": c.get("low_24h"),
-            "circulating_supply": c.get("circulating_supply"),
-            "ath": c.get("ath"),
+            "current_price": _round5(c.get("current_price")),
+            "market_cap": _round5(c.get("market_cap")),
+            "total_volume": _round5(c.get("total_volume")),
+            "price_change_24h": _round5(c.get("price_change_24h")),
+            "price_change_pct_24h": _round5(c.get("price_change_percentage_24h")),
+            "high_24h": _round5(c.get("high_24h")),
+            "low_24h": _round5(c.get("low_24h")),
+            "circulating_supply": _round5(c.get("circulating_supply")),
+            "ath": _round5(c.get("ath")),
             "fetched_at": fetched_at,
         }
         for c in coins
