@@ -1,4 +1,6 @@
+import argparse
 import csv
+import json
 import os
 from datetime import datetime, timezone
 
@@ -69,6 +71,19 @@ def save_to_csv(rows: list[dict], fetched_at: str) -> str:
     print(f"[local] Wrote {len(rows)} rows to {path}")
     return path
 
+def save_to_json(coins: list, fetched_at: str) -> str:
+    # Dump the full, untouched CoinGecko response — every field, no rounding or
+    # column selection (unlike CSV/Snowflake, which use the build_rows subset).
+    os.makedirs(config.CSV_OUTPUT_DIR, exist_ok=True)
+    stamp = fetched_at.replace("+00:00", "Z").replace(":", "").replace("-", "")
+    path = os.path.join(config.CSV_OUTPUT_DIR, f"coingecko_raw_{stamp}.json")
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(coins, f, indent=2)
+
+    print(f"[local] Wrote {len(coins)} coins (full raw fields) to {path}")
+    return path
+
 def _load_private_key_der():
     """Return the private key as DER bytes for key-pair auth, or None if no
     key is configured (then password auth is used). Accepts an inline PEM
@@ -131,14 +146,27 @@ def save_to_snowflake(rows: list[dict]) -> None:
         conn.close()
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch CoinGecko markets for the curated coin set."
+    )
+    parser.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default="csv",
+        help="Local output format (default: csv). 'json' writes the full raw "
+             "CoinGecko response (all fields). Ignored when INGEST_MODE=snowflake.",
+    )
+    args = parser.parse_args()
+
     coins = fetch_coins()
     fetched_at = datetime.now(timezone.utc).isoformat()
-    rows = build_rows(coins, fetched_at)
 
     if config.INGEST_MODE == "snowflake":
-        save_to_snowflake(rows)
+        save_to_snowflake(build_rows(coins, fetched_at))
+    elif args.format == "json":
+        save_to_json(coins, fetched_at)
     else:
-        save_to_csv(rows, fetched_at)
+        save_to_csv(build_rows(coins, fetched_at), fetched_at)
 
 if __name__ == "__main__":
     main()
