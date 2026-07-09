@@ -1,0 +1,15 @@
+# Development targets DEV_DB only. QA / PROD promotion targets are added in a
+# later deployment step — during development, all dbt runs land in dev_db.
+crypto_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'CRYPTO_PIPELINE_ROLE') }}"
+      warehouse: CRYPTO_WH
+      database: DEV_DB
+      schema: PUBLIC          # overridden per-layer by generate_schema_name (silver_crypto / gold_crypto)
+      threads: 4

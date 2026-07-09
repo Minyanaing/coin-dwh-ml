@@ -62,7 +62,27 @@ coin-dwh-ml/
     │   ├── requirements.txt
     │   ├── .env.example                  # copy to .env (gitignored) for local runs
     │   └── data/                         # gitignored — local CSV/JSON output
-    ├── dbt/                              # see Steps 4–5
+    ├── dbt/                              # dbt project (Step 4)
+    │   ├── dbt_project.yml
+    │   ├── profiles.yml                  # dev target -> DEV_DB (qa/prod added later)
+    │   ├── packages.yml                  # dbt_utils
+    │   ├── macros/
+    │   │   └── generate_schema_name.sql
+    │   ├── snapshots/
+    │   │   └── snap_coin.sql             # SCD Type-2 history behind dim_coin
+    │   └── models/
+    │       ├── silver/                   # cleaned, incremental staging of both feeds
+    │       │   ├── _landing__sources.yml
+    │       │   ├── _silver__models.yml
+    │       │   ├── stg_coingecko_snapshot.sql
+    │       │   ├── stg_coingecko_history.sql
+    │       │   └── int_coin_daily.sql
+    │       └── gold/                     # star schema (SCD2 dims + incremental facts, SK/PK/FK)
+    │           ├── _gold__models.yml
+    │           ├── dim_coin.sql
+    │           ├── dim_date.sql
+    │           ├── fct_market_snapshot.sql
+    │           └── fct_daily_market.sql
     ├── snowflake/
     │   ├── setup.sql                # warehouse, 4 databases, schemas, landing tables, role + grants
     │   ├── streams.sql              # append-only Stream on COINGECKO_RAW
@@ -193,279 +213,70 @@ All scripts are safe to re-run (idempotent `IF NOT EXISTS`; the stream deliberat
 
 ---
 
-## Step 4 — dbt models
+## Step 4 — dbt data warehouse (medallion → star schema)
 
-There is no dbt "bronze" layer anymore — `CRYPTO_DB.STG.COINGECKO_RAW` already *is* the raw landing layer, and dbt reads it directly as a `source()`. dbt only builds Silver and Gold, into whichever database the active target points to.
+> **Scope: `dev_db` only.** Every dbt run during development targets `DEV_DB` (`dbt build --target dev`), so all transformed data lands in `dev_db`. Promotion to `qa_db` / `prod_db` is a separate later step and is intentionally not covered here. The implementation lives in `de-pipeline/dbt/`.
 
-### `dbt_project.yml`
+dbt implements the medallion layers on top of the landing zone:
 
-```yaml
-name: crypto_pipeline
-version: '1.0.0'
-profile: crypto_pipeline
+- **Bronze** = the append-only landing tables in `CRYPTO_DB.STG` (`COINGECKO_RAW`, `COINGECKO_HISTORY_RAW`). dbt reads them as **sources** — it does not build them.
+- **Silver** (`dev_db.silver_crypto`) = cleaned, typed, deduplicated staging of *both* raw feeds.
+- **Gold** (`dev_db.gold_crypto`) = an analysis-ready **star schema** (conformed dimensions + fact tables) with surrogate / primary / foreign keys.
 
-models:
-  crypto_pipeline:
-    silver:
-      +schema: silver_crypto
-      +materialized: incremental
-    gold:
-      +schema: gold_crypto
-      +materialized: table
-```
+### Project layout & config (`de-pipeline/dbt/`)
 
-### `profiles.yml` — one target per environment
+- **`dbt_project.yml`** — project `crypto_pipeline`; `silver/` builds into schema `silver_crypto` (all **incremental** tables), `gold/` into `gold_crypto`. Snapshots also land in `silver_crypto`.
+- **`profiles.yml`** — a single `dev` target pointing at `DEV_DB`, credentials via `env_var` (`SNOWFLAKE_ACCOUNT` / `_USER` / `_PASSWORD`, role `CRYPTO_PIPELINE_ROLE`). qa/prod targets are added in the later deployment step.
+- **`packages.yml`** — `dbt_utils` (surrogate keys, date spine, extra tests).
+- **`macros/generate_schema_name.sql`** — emits the configured schema (`silver_crypto` / `gold_crypto`) verbatim instead of dbt's default target-prefixed name, so the same models build cleanly in any database.
+- **`models/silver/_landing__sources.yml`** — declares the two landing tables as sources, pinned to `CRYPTO_DB.STG` regardless of target.
+- **`snapshots/snap_coin.sql`** — the dbt snapshot that powers the SCD Type-2 coin dimension (see Gold).
 
-```yaml
-# dbt/profiles.yml
-crypto_pipeline:
-  target: dev
-  outputs:
-    dev:
-      type: snowflake
-      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user: "{{ env_var('SNOWFLAKE_USER') }}"
-      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
-      role: CRYPTO_PIPELINE_ROLE
-      warehouse: CRYPTO_WH
-      database: DEV_DB
-      schema: PUBLIC
-      threads: 4
-    qa:
-      type: snowflake
-      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user: "{{ env_var('SNOWFLAKE_USER') }}"
-      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
-      role: CRYPTO_PIPELINE_ROLE
-      warehouse: CRYPTO_WH
-      database: QA_DB
-      schema: PUBLIC
-      threads: 4
-    prod:
-      type: snowflake
-      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user: "{{ env_var('SNOWFLAKE_USER') }}"
-      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
-      role: CRYPTO_PIPELINE_ROLE
-      warehouse: CRYPTO_WH
-      database: PROD_DB
-      schema: PUBLIC
-      threads: 4
-```
+**Materialization:** everything is a physical **table** loaded **incrementally** — no views. Silver models and the fact tables are dbt `incremental` models (each processes only new rows); `dim_coin` is rebuilt from the incremental SCD2 snapshot; `dim_date` is a small generated calendar table.
 
-`database` is the only thing that changes between targets — the schema name (`silver_crypto` / `gold_crypto`) is identical across dev/qa/prod, which is what promotes a model unchanged from one environment to the next.
+Run with `dbt deps` then `dbt build --target dev` from `de-pipeline/dbt/`. `dbt build` runs models, snapshots, and tests together, so the key/type tests below gate the build.
 
-### Macro — pin schema names across environments
+### Silver — `dev_db.silver_crypto` (clean & conform the two feeds)
 
-By default dbt prefixes a custom `+schema` with the target's default schema (e.g. `public_silver_crypto`). Since environment separation here comes from the **database**, not a schema prefix, override it:
+Silver stages **both** ingestion feeds — the 6-hourly snapshot (`de-ingest.yml` / `ingest_coingecko.py`) and the manual history backfill (`backfill_coingecko_history.py`). Because the landing tables are append-only, every staging model **deduplicates** on its natural key, casts types, uppercases symbols, drops bad rows (null id, non-positive price), and adds a `price_date`. All three are **incremental** tables.
 
-```sql
--- dbt/macros/generate_schema_name.sql
-{% macro generate_schema_name(custom_schema_name, node) -%}
-    {%- if custom_schema_name is none -%}
-        {{ target.schema }}
-    {%- else -%}
-        {{ custom_schema_name | trim }}
-    {%- endif -%}
-{%- endmacro %}
-```
+| Model | Source | Grain | Incremental key / watermark |
+|---|---|---|---|
+| `stg_coingecko_snapshot` | `coingecko_raw` (6-hourly) | one row per coin per snapshot `fetched_at` | merge on `coin_id`+`fetched_at`; new rows where `fetched_at` > max |
+| `stg_coingecko_history` | `coingecko_history_raw` (backfill) | one row per coin per day | merge on `coin_id`+`price_date` (latest `fetched_at` wins); new rows where `fetched_at` > max |
+| `int_coin_daily` | the two models above | one row per coin per day (unified) | merge on `coin_id`+`price_date`; recomputes only days with new source data (`_synced_at` watermark) |
 
-### Source — shared landing table
+`int_coin_daily` unifies both feeds onto one continuous **daily** series per coin: the historical backfill is the authoritative daily close, and for recent days only covered by the 6-hourly snapshots it derives the day's close from the last intraday observation (history wins on overlap). Its incremental logic recomputes each *touched* day from **all** of that day's source rows — so the evolving current-day close and any late-arriving backfilled day both resolve correctly, with no history/snapshot priority inversion. Tests assert `not_null` keys, positive prices, and uniqueness of each grain.
 
-```yaml
-# dbt/models/silver/sources.yml
-version: 2
+### Gold — `dev_db.gold_crypto` (star schema)
 
-sources:
-  - name: landing
-    database: CRYPTO_DB   # always the shared landing db, regardless of target
-    schema: STG
-    tables:
-      - name: coingecko_raw
-```
+A classic star: two **conformed dimensions** and two **incremental fact tables**. Every row carries a **surrogate key (SK)** built with `dbt_utils.generate_surrogate_key`; facts carry the dimensions' SKs as **foreign keys**. Descriptive attributes live only in the dimensions; facts hold measures.
 
-### Silver — cleaned, typed, deduplicated (incremental)
+**Dimensions**
 
-```sql
--- dbt/models/silver/stg_crypto_prices.sql
-{{
-  config(
-    materialized     = 'incremental',
-    unique_key       = ['id', 'fetched_at'],
-    on_schema_change = 'sync_all_columns'
-  )
-}}
+| Table | PK (surrogate) | Natural key | Type | Attributes |
+|---|---|---|---|---|
+| `dim_coin` | `coin_sk` (per version) | `coin_id` (durable) | **SCD Type-2** | `symbol`, `name`, `asset_type` (coin / stablecoin), `valid_from`, `valid_to`, `is_current` |
+| `dim_date` | `date_sk` (`YYYYMMDD`) | calendar date | static | year, quarter, month, month name, day, ISO weekday, `is_weekend` |
 
-WITH source AS (
-  SELECT * FROM {{ source('landing', 'coingecko_raw') }}
+- **`dim_coin` is SCD Type-2.** Its history is tracked by the `snap_coin` dbt **snapshot** (`check` strategy on `symbol` / `name` / `asset_type`), which writes a new version row only when a coin's attributes change and stamps `dbt_valid_from` / `dbt_valid_to`. `dim_coin` exposes those as `valid_from` / `valid_to` / `is_current`, with `coin_sk` unique **per version**. The earliest version per coin is back-dated so facts whose event pre-dates the first snapshot still resolve to a version.
+- **`dim_date` is a static generated calendar** (a `dbt_utils.date_spine`). SCD Type-2 does not apply — calendar attributes never change.
 
-  {% if is_incremental() %}
-    WHERE fetched_at > (SELECT MAX(fetched_at) FROM {{ this }})
-  {% endif %}
-),
+**Facts** (both `incremental`)
 
-cleaned AS (
-  SELECT
-    id                                         AS coin_id,
-    UPPER(symbol)                              AS symbol,
-    name,
-    CAST(current_price    AS DECIMAL(20,8))    AS price_usd,
-    CAST(market_cap       AS DECIMAL(28,2))    AS market_cap_usd,
-    CAST(total_volume     AS DECIMAL(28,2))    AS volume_24h_usd,
-    CAST(price_change_24h AS DECIMAL(20,8))    AS price_change_24h,
-    ROUND(price_change_pct_24h, 4)             AS price_change_pct_24h,
-    CAST(high_24h         AS DECIMAL(20,8))    AS high_24h,
-    CAST(low_24h          AS DECIMAL(20,8))    AS low_24h,
-    CAST(ath              AS DECIMAL(20,8))    AS all_time_high,
-    DATE_TRUNC('hour', fetched_at)             AS fetched_hour,
-    CAST(fetched_at AS DATE)                   AS price_date,
-    fetched_at,
-    _loaded_at
-  FROM source
-  WHERE current_price > 0
-    AND id IS NOT NULL
-)
+| Table | PK (surrogate) | FKs | Grain | Measures |
+|---|---|---|---|---|
+| `fct_market_snapshot` | `snapshot_sk` | `coin_sk`, `date_sk` | coin × snapshot timestamp (6-hourly) | current price, market cap, volume, 24h change & %, 24h high/low, circulating supply, ATH |
+| `fct_daily_market` | `daily_market_sk` | `coin_sk`, `date_sk` | coin × day | close, previous close, daily return %, market cap, volume |
 
-SELECT * FROM cleaned
-```
+Each fact resolves `coin_sk` with an **SCD Type-2 range join** to `dim_coin` — matching the coin version whose `[valid_from, valid_to)` window contains the event's timestamp/date — so a fact always points to the coin attributes that were in effect at the time.
 
-```yaml
-# dbt/models/silver/stg_crypto_prices.yml
-version: 2
-models:
-  - name: stg_crypto_prices
-    description: Cleaned and typed crypto price records from CoinGecko
-    columns:
-      - name: coin_id
-        tests: [not_null]
-      - name: price_usd
-        tests:
-          - not_null
-          - dbt_utils.accepted_range:
-              min_value: 0
-              inclusive: false
-      - name: fetched_at
-        tests: [not_null]
-      - name: symbol
-        tests: [not_null]
-```
+Keys are **enforced by dbt tests**, so the model *is* the contract:
 
-### Gold mart 1 — daily returns
+- **PK** — `unique` + `not_null` on every SK (`coin_sk` is unique per version; `coin_id` is only `not_null` under SCD2, with a test that exactly one version per coin is `is_current`).
+- **FK** — `relationships` tests from each fact's `coin_sk` / `date_sk` back to the parent dimension's SK.
 
-```sql
--- dbt/models/gold/mart_daily_returns.sql
-{{ config(materialized='table') }}
-
-WITH daily AS (
-  SELECT
-    coin_id,
-    symbol,
-    name,
-    price_date,
-    FIRST_VALUE(price_usd) OVER (
-      PARTITION BY coin_id, price_date
-      ORDER BY fetched_at ASC
-      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-    ) AS open_price,
-    LAST_VALUE(price_usd) OVER (
-      PARTITION BY coin_id, price_date
-      ORDER BY fetched_at ASC
-      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-    ) AS close_price,
-    MAX(high_24h)        AS day_high,
-    MIN(low_24h)         AS day_low,
-    AVG(volume_24h_usd)  AS avg_volume
-  FROM {{ ref('stg_crypto_prices') }}
-  GROUP BY coin_id, symbol, name, price_date, price_usd, fetched_at
-)
-
-SELECT
-  coin_id, symbol, name, price_date,
-  open_price, close_price, day_high, day_low,
-  ROUND(
-    (close_price - open_price) / NULLIF(open_price, 0) * 100, 4
-  ) AS daily_return_pct,
-  avg_volume
-FROM daily
-```
-
-### Gold mart 2 — 30-day volatility
-
-```sql
--- dbt/models/gold/mart_volatility_30d.sql
-{{ config(materialized='table') }}
-
-SELECT
-  coin_id,
-  symbol,
-  price_date,
-  STDDEV(daily_return_pct) OVER (
-    PARTITION BY coin_id
-    ORDER BY price_date
-    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-  ) AS volatility_30d,
-  AVG(daily_return_pct) OVER (
-    PARTITION BY coin_id
-    ORDER BY price_date
-    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-  ) AS avg_return_30d
-FROM {{ ref('mart_daily_returns') }}
-ORDER BY price_date DESC, volatility_30d DESC
-```
-
-### Gold mart 3 — top movers
-
-```sql
--- dbt/models/gold/mart_top_movers.sql
-{{ config(materialized='table') }}
-
-WITH latest AS (
-  SELECT *
-  FROM {{ ref('mart_daily_returns') }}
-  WHERE price_date = (
-    SELECT MAX(price_date) FROM {{ ref('mart_daily_returns') }}
-  )
-),
-
-ranked AS (
-  SELECT *,
-    RANK() OVER (ORDER BY daily_return_pct DESC) AS gainer_rank,
-    RANK() OVER (ORDER BY daily_return_pct ASC)  AS loser_rank
-  FROM latest
-)
-
-SELECT
-  coin_id, symbol, name, price_date,
-  close_price, daily_return_pct,
-  CASE
-    WHEN gainer_rank <= 10 THEN 'top_gainer'
-    WHEN loser_rank  <= 10 THEN 'top_loser'
-  END AS mover_type
-FROM ranked
-WHERE gainer_rank <= 10 OR loser_rank <= 10
-ORDER BY daily_return_pct DESC
-```
-
-### Snapshot — track market cap changes over time
-
-```sql
--- dbt/snapshots/snap_market_cap_history.sql
-{% snapshot snap_market_cap_history %}
-
-{{
-  config(
-    target_schema = 'silver_crypto',
-    unique_key    = 'coin_id',
-    strategy      = 'check',
-    check_cols    = ['market_cap_usd', 'price_usd'],
-  )
-}}
-
-SELECT coin_id, symbol, name, price_usd, market_cap_usd, price_date
-FROM {{ ref('stg_crypto_prices') }}
-
-{% endsnapshot %}
-```
+The two facts share the same conformed dimensions, so `fct_market_snapshot` (intraday detail) and `fct_daily_market` (daily series) can be sliced by the same coin/date attributes — ready for BI on `dev_db.gold_crypto`.
 
 ---
 

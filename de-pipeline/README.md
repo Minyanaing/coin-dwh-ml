@@ -176,7 +176,7 @@ python ingestion\ingest_coingecko.py
 python ingestion/ingest_coingecko.py
 ```
 
-Output: `ingestion/data/coingecko_raw_<timestamp>.csv` — open it and confirm the 50 rows of CoinGecko data look right.
+Output: `ingestion/data/coingecko_raw_<timestamp>.csv` — open it and confirm the rows (one per coin in the curated set) look right.
 
 ### 2.3 Switch to loading into Snowflake
 
@@ -202,3 +202,101 @@ python ingestion/ingest_coingecko.py
 ```
 
 See [`ingest_coingecko.py`](ingestion/ingest_coingecko.py) and [`config.py`](ingestion/config.py) for the full local/Snowflake mode switch, and the [project plan](../.claude/crypto-de-pipeline-project-plan.md) for the dbt/CI/CD steps that follow ingestion.
+
+---
+
+## 3. Local dbt setup & running (dev_db)
+
+The dbt project lives in [`dbt/`](dbt/) and builds the medallion → star schema (Silver `silver_crypto`, Gold `gold_crypto`) into **`DEV_DB`** — the only target during development. `dbt/profiles.yml` is committed and reads all credentials from **environment variables**, so no secrets are stored in the repo.
+
+**Prerequisites:**
+
+1. `snowflake/setup.sql` has been applied, so `DEV_DB.SILVER_CRYPTO` / `DEV_DB.GOLD_CRYPTO` and `CRYPTO_PIPELINE_ROLE` already exist. dbt **uses** those schemas — it does not create them.
+2. There is raw data in `CRYPTO_DB.STG` to transform — run the ingestion in Snowflake mode first (section 2.3), otherwise Silver/Gold build empty.
+
+### 3.1 Install dbt
+
+Reuse the same `de-pipeline/.venv` from section 2.1 (or make a fresh one), then add the Snowflake adapter:
+
+```cmd
+:: Windows cmd
+cd de-pipeline
+.venv\Scripts\activate.bat
+pip install dbt-snowflake==1.7.0
+```
+
+```bash
+# Linux / macOS
+cd de-pipeline
+source .venv/bin/activate
+pip install dbt-snowflake==1.7.0
+```
+
+### 3.2 Set the connection environment variables
+
+`dbt/profiles.yml` resolves the connection from these variables via `env_var()`:
+
+| Env var | Required | Purpose |
+|---|---|---|
+| `SNOWFLAKE_ACCOUNT` | yes | Account identifier, e.g. `xy12345.us-east-1` |
+| `SNOWFLAKE_USER` | yes | A **password-login** Snowflake user that has `CRYPTO_PIPELINE_ROLE` |
+| `SNOWFLAKE_PASSWORD` | yes | That user's password |
+| `SNOWFLAKE_ROLE` | no (default `CRYPTO_PIPELINE_ROLE`) | Role dbt builds as |
+
+> Use a real login user here — **not** `DEVELOPER_SVC`, which is `TYPE = SERVICE` (key-pair only, no password). Grant your dev login the role once: `GRANT ROLE CRYPTO_PIPELINE_ROLE TO USER <your_login>;`
+> The warehouse (`CRYPTO_WH`) and database (`DEV_DB`) are pinned in `profiles.yml`, so they don't need env vars.
+
+```cmd
+:: Windows cmd — session-scoped; re-run in each new shell
+set SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+set SNOWFLAKE_USER=your_dev_login
+set SNOWFLAKE_PASSWORD=your_password
+set SNOWFLAKE_ROLE=CRYPTO_PIPELINE_ROLE
+```
+
+```bash
+# Linux / macOS — session-scoped; add to ~/.bashrc / ~/.zshrc to persist
+export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+export SNOWFLAKE_USER=your_dev_login
+export SNOWFLAKE_PASSWORD='your_password'
+export SNOWFLAKE_ROLE=CRYPTO_PIPELINE_ROLE   # optional
+```
+
+> dbt reads OS environment variables directly — it does **not** load `ingestion/.env` (that file is only for the Python ingestion via `python-dotenv`).
+
+### 3.3 Verify the connection
+
+`profiles.yml` sits inside the project dir (not `~/.dbt`), so pass `--profiles-dir .` and run from `de-pipeline/dbt/`:
+
+```cmd
+cd dbt
+dbt deps --profiles-dir .            :: install dbt_utils (first time only)
+dbt debug --profiles-dir .           :: checks creds + DEV_DB reachability
+```
+
+```bash
+cd dbt
+dbt deps --profiles-dir .            # install dbt_utils (first time only)
+dbt debug --profiles-dir .           # checks creds + DEV_DB reachability
+```
+
+### 3.4 Build & test
+
+`dbt build` runs the models, the SCD2 snapshot, and all tests together (a failing PK/FK/type test fails the build):
+
+```bash
+dbt build --target dev --profiles-dir .
+```
+
+Handy subsets while developing (all from `de-pipeline/dbt/`, all take `--profiles-dir .`):
+
+| Command | What it does |
+|---|---|
+| `dbt run --select silver` | build only the Silver staging models |
+| `dbt run --select gold` | build only the Gold dims + facts |
+| `dbt build --select stg_coingecko_snapshot+` | a model **and** everything downstream of it |
+| `dbt snapshot` | refresh the SCD Type-2 `snap_coin` snapshot on its own |
+| `dbt test` | run the PK / FK / uniqueness / range tests only |
+| `dbt docs generate` then `dbt docs serve` | browse the lineage graph + docs locally |
+
+Everything targets `DEV_DB` only. Promotion to `QA_DB` / `PROD_DB` is a later step and isn't part of local development.

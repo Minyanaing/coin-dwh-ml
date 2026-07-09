@@ -1,0 +1,32 @@
+name: 'crypto_pipeline'
+version: '1.0.0'
+config-version: 2
+
+profile: 'crypto_pipeline'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  crypto_pipeline:
+    # Silver = cleaned, typed, deduplicated staging of the two landing feeds.
+    # All silver models are incremental tables (each processes only new rows).
+    silver:
+      +schema: silver_crypto
+      +materialized: incremental
+    # Gold = analysis-ready star schema. Facts are incremental (they override
+    # below); dimensions are tables — dim_coin is SCD Type-2, sourced from an
+    # incremental dbt snapshot, and dim_date is a static generated calendar.
+    gold:
+      +schema: gold_crypto
+      +materialized: table
+
+snapshots:
+  crypto_pipeline:
+    +target_schema: silver_crypto
