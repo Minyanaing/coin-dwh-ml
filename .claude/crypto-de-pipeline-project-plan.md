@@ -2,17 +2,21 @@
 
 **Stack:** CoinGecko API · Snowflake · dbt Core · GitHub Actions · Snowflake Streams & Tasks
 
+> This document is the **plan and context** — what each piece does and why. It intentionally avoids line-by-line code for the ingestion/infra layers (Steps 1–3); the implementation lives in the referenced files under `de-pipeline/` and `.github/workflows/`. Steps 4+ still include representative dbt code.
+
 ---
 
 ## Project overview
 
-A production-grade daily crypto market data pipeline that ingests OHLC prices and market cap data for the top 50 tokens from CoinGecko, lands them in a shared Snowflake landing database via a scheduled GitHub Actions job (daily, 8AM Bangkok time), and promotes them through dbt-built Silver/Gold layers across three isolated environment databases (dev → qa → prod) — with CI/CD and environment promotion gates enforced through GitHub Actions.
+A daily crypto market-data pipeline for a **curated set of coins** (top market-cap coins + major stablecoins). Each day a scheduled GitHub Actions job pulls the latest snapshot from CoinGecko into a shared Snowflake landing database; dbt then builds Silver/Gold marts and promotes them across three isolated environment databases (dev → qa → prod). A separate, manual workflow backfills daily history for the same coins. CI/CD and environment promotion gates are enforced through GitHub Actions.
 
-> A Snowflake-native Python Task alternative for ingestion exists in the codebase (`snowflake/ingest_task.sql`, Step 3b) but is currently **disabled** — it requires an External Access Integration, which isn't available on the Snowflake trial account this was built against. The code is kept commented out for later, once the account is upgraded. Production ingestion runs the GitHub Actions way (Step 3a / Step 5) for now.
+> A Snowflake-native Python Task alternative for ingestion exists in the codebase (`snowflake/ingest_task.sql`, Step 3b) but is **disabled** — it needs an External Access Integration, unavailable on the Snowflake trial account this was built against. It's kept commented out for later. Production ingestion runs the GitHub Actions way (Step 3a).
+
+---
 
 ### Database / schema architecture
 
-Instead of a single database with Bronze/Silver/Gold schemas, the pipeline is split across **four databases**, separating the shared landing zone from environment-specific transformed data:
+The pipeline is split across **four databases**, separating the shared landing zone from environment-specific transformed data:
 
 | Database | Purpose | Schemas |
 |---|---|---|
@@ -21,7 +25,16 @@ Instead of a single database with Bronze/Silver/Gold schemas, the pipeline is sp
 | `QA_DB` | dbt QA target — validated before prod promotion | `SILVER_CRYPTO`, `GOLD_CRYPTO` |
 | `PROD_DB` | dbt production target | `SILVER_CRYPTO`, `GOLD_CRYPTO` |
 
-Raw ingestion always lands in `CRYPTO_DB.STG` — there is only ever one copy of raw data. dbt then builds Silver/Gold into whichever database the active `--target` (`dev` / `qa` / `prod`) points to, reading from the same shared source every time. A single Snowflake role (`CRYPTO_PIPELINE_ROLE`) and warehouse (`CRYPTO_WH`) are shared across all four databases.
+Raw ingestion always lands in `CRYPTO_DB.STG` — there is only ever one copy of raw data. dbt then builds Silver/Gold into whichever database the active `--target` (`dev` / `qa` / `prod`) points to, reading from the same shared source every time. A single warehouse (`CRYPTO_WH`) is shared across all four databases.
+
+### Snowflake accounts & auth
+
+Two Snowflake identities, kept deliberately separate:
+
+- **`DEVELOPER_SVC`** — the infra/CI service account (`TYPE = SERVICE`, key-pair auth only). Holds `SYSADMIN` + `USERADMIN`. Used by `infra-deploy.yml` to apply the SQL scripts, and reused by the ingestion workflows (running as `SYSADMIN`, which owns `CRYPTO_DB.STG`). Setup is documented in `de-pipeline/README.md`.
+- **`CRYPTO_PIPELINE_ROLE`** — the narrower data-plane role dbt uses (`profiles.yml`). Password auth in CI.
+
+Full account-creation steps (key-pair generation, grants, one-time `ACCOUNTADMIN` grants) live in `de-pipeline/README.md`.
 
 ---
 
@@ -33,610 +46,150 @@ coin-dwh-ml/
 ├── .github/
 │   └── workflows/
 │       ├── infra-ci.yml             # PR: sqlfluff syntax check on snowflake/**
-│       ├── infra-deploy.yml         # merge to main: apply setup/streams/tasks to Snowflake (ingest_task disabled)
-│       ├── de-ingest.yml            # cron 8AM Bangkok: run ingest_coingecko.py -> CRYPTO_DB.STG (standalone)
+│       ├── infra-deploy.yml         # merge to main: apply setup/streams/tasks to Snowflake (key-pair)
+│       ├── de-ingest.yml            # cron (daily): run ingest_coingecko.py -> CRYPTO_DB.STG (standalone)
+│       ├── de-ingest-history.yml    # MANUAL only: backfill daily history -> COINGECKO_HISTORY_RAW
 │       ├── de-ci.yml                # PR: dbt build + test against dev_db
-│       └── de-deploy.yml            # promote dev_db -> qa_db -> prod_db (dbt only, no ingestion)
+│       └── de-deploy.yml            # promote dev_db -> qa_db -> prod_db (dbt only)
 └── de-pipeline/
     ├── ingestion/
-    │   ├── ingest_coingecko.py      # PRODUCTION ingestion (run by de-ingest.yml) + local testing
+    │   ├── config.py                     # env-based config (modes, coin set, creds) — shared
+    │   ├── fetch_data.py                 # CoinGecko API access (fetch_coins, fetch_history) — shared
+    │   ├── snowflake_connection.py       # get_snowflake_conn (key-pair OR password) — shared
+    │   ├── transforms.py                 # round5() and other small shared helpers
+    │   ├── ingest_coingecko.py           # daily snapshot (production + local; --format csv|json)
+    │   ├── backfill_coingecko_history.py # manual historical daily backfill
     │   ├── requirements.txt
-    │   ├── config.py                # env-based config (INGEST_MODE=local|snowflake)
-    │   ├── .env                     # gitignored — local secrets/mode override
-    │   └── data/                    # gitignored — CSV output from local runs
-    ├── dbt/
-    │   ├── dbt_project.yml
-    │   ├── profiles.yml             # uses env vars — never commit secrets
-    │   ├── packages.yml
-    │   ├── models/
-    │   │   ├── silver/
-    │   │   │   ├── sources.yml               # source: CRYPTO_DB.STG.COINGECKO_RAW
-    │   │   │   ├── stg_crypto_prices.sql
-    │   │   │   └── stg_crypto_prices.yml     # schema + tests
-    │   │   └── gold/
-    │   │       ├── mart_daily_returns.sql
-    │   │       ├── mart_top_movers.sql
-    │   │       └── mart_volatility_30d.sql
-    │   ├── snapshots/
-    │   │   └── snap_market_cap_history.sql
-    │   ├── seeds/
-    │   │   └── coin_metadata.csv             # token name, symbol, category
-    │   ├── macros/
-    │   │   └── generate_schema_name.sql      # pins schema to silver_crypto/gold_crypto (no target prefix)
-    │   └── tests/
-    │       └── assert_price_positive.sql
+    │   ├── .env.example                  # copy to .env (gitignored) for local runs
+    │   └── data/                         # gitignored — local CSV/JSON output
+    ├── dbt/                              # see Steps 4–5
     ├── snowflake/
-    │   ├── setup.sql                # warehouses, databases, roles, schemas
-    │   ├── streams.sql              # Snowflake Stream definition
-    │   ├── tasks.sql                # Snowflake Task (new-data signal)
-    │   ├── ingest_task.sql          # DISABLED — Snowflake Task ingestion, needs External Access Integration (not on trial)
+    │   ├── setup.sql                # warehouse, 4 databases, schemas, landing tables, role + grants
+    │   ├── streams.sql              # append-only Stream on COINGECKO_RAW
+    │   ├── tasks.sql                # "new data" signal Task
+    │   ├── ingest_task.sql          # DISABLED — Snowflake Task ingestion (needs External Access Integration)
     │   ├── run_sql.py               # applies *.sql via key-pair auth (used by infra-deploy.yml)
     │   └── requirements.txt         # snowflake-connector-python, cryptography
     ├── .keys/                       # gitignored — local rsa_key.p8 / rsa_key.pub
-    └── README.md
+    └── README.md                    # service-account setup + local run instructions
 ```
 
----
-Update README.md file
-- instruct to create a service account to use for the developement using KEY-PAIR. Give permission for SYSADMIN and USERADMIN
-- how to setup python locally and run the ingestion locally. Local instructions must be for windows 11 CMD and linux/mac
 ---
 
 ## Step 1 — Snowflake setup
 
-Run `snowflake/setup.sql` once as SYSADMIN to create all objects.
+**File:** `snowflake/setup.sql` — the single, idempotent (`CREATE ... IF NOT EXISTS`) script that stands up all Snowflake objects. Applied by `infra-deploy.yml` (Deployment Step-1), or runnable by hand.
 
-```sql
--- snowflake/setup.sql
+It creates:
 
--- Warehouse (shared across all environments)
-CREATE WAREHOUSE IF NOT EXISTS CRYPTO_WH
-  WAREHOUSE_SIZE = 'X-SMALL'
-  AUTO_SUSPEND = 60
-  AUTO_RESUME = TRUE;
+- **Warehouse** `CRYPTO_WH` (X-Small, auto-suspend/resume) — shared by everything.
+- **Four databases**: `CRYPTO_DB` (schema `STG`), and `DEV_DB` / `QA_DB` / `PROD_DB` (each with `SILVER_CRYPTO` + `GOLD_CRYPTO`).
+- **Two landing tables** in `CRYPTO_DB.STG`, both append-only with `fetched_at` / `_loaded_at` audit columns:
+  - `COINGECKO_RAW` — daily snapshot (current price, market cap, volume, 24h changes, ATH, etc.).
+  - `COINGECKO_HISTORY_RAW` — one row per coin per day (`price_date`, `price`, `market_cap`, `total_volume`) for the manual backfill.
+- **Role** `CRYPTO_PIPELINE_ROLE` + grants across all four databases, including `ON FUTURE TABLES/SCHEMAS/VIEWS` so dbt-created objects are auto-covered.
 
--- ============================================================
--- CRYPTO_DB — landing zone, shared across all environments
--- ============================================================
-CREATE DATABASE IF NOT EXISTS CRYPTO_DB;
-CREATE SCHEMA IF NOT EXISTS CRYPTO_DB.STG;   -- raw ingestion (append-only)
+**Role model inside the script:** `SYSADMIN` owns warehouses/databases/schemas/tables; `USERADMIN` owns role creation. The script switches roles itself (`USE ROLE ...`), because `SYSADMIN` alone cannot run `CREATE ROLE`.
 
-CREATE TABLE IF NOT EXISTS CRYPTO_DB.STG.COINGECKO_RAW (
-  id                       VARCHAR,
-  symbol                   VARCHAR,
-  name                     VARCHAR,
-  current_price            FLOAT,
-  market_cap               FLOAT,
-  total_volume             FLOAT,
-  price_change_24h         FLOAT,
-  price_change_pct_24h     FLOAT,
-  high_24h                 FLOAT,
-  low_24h                  FLOAT,
-  circulating_supply       FLOAT,
-  ath                      FLOAT,
-  fetched_at               TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-  _loaded_at               TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-);
+**One-time `ACCOUNTADMIN` prerequisites** (documented in `README.md`, run once by hand — *not* automated):
 
--- ============================================================
--- DEV_DB — dbt development target
--- ============================================================
-CREATE DATABASE IF NOT EXISTS DEV_DB;
-CREATE SCHEMA IF NOT EXISTS DEV_DB.SILVER_CRYPTO;
-CREATE SCHEMA IF NOT EXISTS DEV_DB.GOLD_CRYPTO;
-
--- ============================================================
--- QA_DB — dbt QA target, validated before prod promotion
--- ============================================================
-CREATE DATABASE IF NOT EXISTS QA_DB;
-CREATE SCHEMA IF NOT EXISTS QA_DB.SILVER_CRYPTO;
-CREATE SCHEMA IF NOT EXISTS QA_DB.GOLD_CRYPTO;
-
--- ============================================================
--- PROD_DB — dbt production target
--- ============================================================
-CREATE DATABASE IF NOT EXISTS PROD_DB;
-CREATE SCHEMA IF NOT EXISTS PROD_DB.SILVER_CRYPTO;
-CREATE SCHEMA IF NOT EXISTS PROD_DB.GOLD_CRYPTO;
-
--- ============================================================
--- Service account role for ingestion + dbt — shared across all databases
--- ============================================================
-CREATE ROLE IF NOT EXISTS CRYPTO_PIPELINE_ROLE;
-GRANT USAGE ON WAREHOUSE CRYPTO_WH TO ROLE CRYPTO_PIPELINE_ROLE;
-
-GRANT ALL ON DATABASE CRYPTO_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL SCHEMAS IN DATABASE CRYPTO_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL TABLES IN DATABASE CRYPTO_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE TABLES IN DATABASE CRYPTO_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-
-GRANT ALL ON DATABASE DEV_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL SCHEMAS IN DATABASE DEV_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE SCHEMAS IN DATABASE DEV_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL TABLES IN DATABASE DEV_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE TABLES IN DATABASE DEV_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL VIEWS IN DATABASE DEV_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE VIEWS IN DATABASE DEV_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-
-GRANT ALL ON DATABASE QA_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL SCHEMAS IN DATABASE QA_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE SCHEMAS IN DATABASE QA_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL TABLES IN DATABASE QA_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE TABLES IN DATABASE QA_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL VIEWS IN DATABASE QA_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE VIEWS IN DATABASE QA_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-
-GRANT ALL ON DATABASE PROD_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL SCHEMAS IN DATABASE PROD_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE SCHEMAS IN DATABASE PROD_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL TABLES IN DATABASE PROD_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE TABLES IN DATABASE PROD_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON ALL VIEWS IN DATABASE PROD_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-GRANT ALL ON FUTURE VIEWS IN DATABASE PROD_DB TO ROLE CRYPTO_PIPELINE_ROLE;
-```
+- `GRANT EXECUTE TASK ON ACCOUNT TO ROLE SYSADMIN` — without it, `ALTER TASK ... RESUME` fails for any task `SYSADMIN` owns (Step 2).
+- `GRANT MANAGE GRANTS ON ACCOUNT TO ROLE SYSADMIN` — without it, the `GRANT ... ON FUTURE ...` statements fail even though `SYSADMIN` owns the databases.
 
 ---
 
 ## Step 2 — Snowflake Stream & Task
 
-A single Stream/Task pair lives on the shared landing table — it only signals that new raw data has arrived. It does **not** chain Bronze→Silver→Gold anymore, since Silver/Gold now live in separate per-environment databases and are built by dbt (`de-deploy.yml`), not by a Snowflake Task DAG.
+A single Stream/Task pair on the shared landing table — it only **signals** that new raw data arrived. It does not chain Bronze→Silver→Gold; the real Silver/Gold builds run through dbt (Step 5).
 
-```sql
--- snowflake/streams.sql
--- IF NOT EXISTS (not OR REPLACE) — this script re-runs on every infra
--- deploy, and CREATE OR REPLACE STREAM would reset the tracked offset,
--- silently re-surfacing already-consumed rows as "new" every deploy.
-
--- Captures every new INSERT on the raw landing table
-CREATE STREAM IF NOT EXISTS CRYPTO_DB.STG.STREAM_COINGECKO_RAW
-  ON TABLE CRYPTO_DB.STG.COINGECKO_RAW
-  APPEND_ONLY = TRUE;
-```
-
-```sql
--- snowflake/tasks.sql
-
--- Fires when the stream has unconsumed rows (polls hourly).
--- This is a lightweight signal only — actual Silver/Gold builds
--- run via dbt in GitHub Actions (de-deploy.yml), scoped per
--- environment (dev_db / qa_db / prod_db) by --target.
-CREATE OR REPLACE TASK CRYPTO_DB.STG.TASK_NOTIFY_NEW_DATA
-  WAREHOUSE = CRYPTO_WH
-  SCHEDULE  = '60 MINUTE'
-WHEN
-  SYSTEM$STREAM_HAS_DATA('CRYPTO_DB.STG.STREAM_COINGECKO_RAW')
-AS
-  SELECT CURRENT_TIMESTAMP();
-
-ALTER TASK CRYPTO_DB.STG.TASK_NOTIFY_NEW_DATA RESUME;
-```
+- **`streams.sql`** — `STREAM_COINGECKO_RAW`, an `APPEND_ONLY` stream on `COINGECKO_RAW`. Created with `IF NOT EXISTS` (not `OR REPLACE`) on purpose: re-running on every infra deploy must **not** reset the stream's tracked offset and re-surface already-consumed rows.
+- **`tasks.sql`** — `TASK_NOTIFY_NEW_DATA`, polls hourly and fires only when `SYSTEM$STREAM_HAS_DATA` is true. It's a lightweight, near-zero-cost signal/monitoring hook, not a transform.
 
 ---
 
 ## Step 3 — Ingestion
 
-- **3a. `ingestion/ingest_coingecko.py`** — this is what actually runs in production. The same script serves double duty: run it locally (`INGEST_MODE=local`, the default) to test against a CSV with no Snowflake credentials, or let its **own dedicated workflow `de-ingest.yml`** run it on a daily schedule (`INGEST_MODE=snowflake`) to load `CRYPTO_DB.STG.COINGECKO_RAW`. Ingestion is deliberately a **separate** GitHub Action from dbt promotion (`de-deploy.yml`, Step 5) — the two run on independent schedules and neither blocks the other.
-- **3b. A Snowflake Python Task** (`snowflake/ingest_task.sql`) — a from-inside-Snowflake alternative, **currently disabled**. It requires an External Access Integration for network egress, which the Snowflake trial account this was built against can't create. The code stays in the repo, commented out, for when the account is upgraded — see the note at the end of 3b for what re-enabling it involves.
+Ingestion is **its own concern**, separate from dbt. There are two implementations:
 
-### 3a. Production + local ingestion script
+- **3a. Python + GitHub Actions** (`ingestion/*.py`, `de-ingest.yml`) — **what runs in production.** Same code runs locally for testing.
+- **3b. Snowflake Python Task** (`snowflake/ingest_task.sql`) — **disabled** (needs an External Access Integration, not available on trial). Kept commented out.
 
-`config.py` / `INGEST_MODE` supports two modes:
+A separate **manual** workflow backfills history (`backfill_coingecko_history.py`, `de-ingest-history.yml`).
 
-- **`local`** (default) — fetches from CoinGecko and writes a CSV to `ingestion/data/`. No Snowflake credentials required. Use this to test the script and eyeball the data before it ever touches Snowflake.
-- **`snowflake`** — same fetch, but loads rows into the shared landing table `CRYPTO_DB.STG.COINGECKO_RAW` instead of writing a CSV. This is the mode `de-ingest.yml` runs in production (see below); running it locally is for manually verifying the write path before trusting the scheduled job.
+### 3a. Python ingestion (production + local)
 
-Both modes share the same `fetch_coins()` / `build_rows()` logic, so there's nothing to keep in sync between "what I tested locally" and "what gets loaded."
+**Modular layout** — shared concerns are factored into small modules so the daily snapshot and the backfill reuse them:
 
-#### `config.py` — env-based config
+| File | Responsibility |
+|---|---|
+| `config.py` | All env-based config: run mode, coin set, CoinGecko key, Snowflake creds. |
+| `fetch_data.py` | CoinGecko API access — `fetch_coins()` (markets snapshot) and `fetch_history()` (daily series), with host/auth selection + 429 backoff. |
+| `snowflake_connection.py` | `get_snowflake_conn()` — key-pair **or** password auth (auto-selected). |
+| `transforms.py` | `round5()` — round numeric values to 5 decimals (None-safe). |
+| `ingest_coingecko.py` | Daily snapshot: fetch → build rows → write. Entry point for `de-ingest.yml`. |
+| `backfill_coingecko_history.py` | Manual historical daily backfill. |
 
-```python
-# ingestion/config.py
-import os
+**Configuration** (`config.py`, all overridable via env / `.env`):
 
-from dotenv import load_dotenv
+| Setting | Default | Purpose |
+|---|---|---|
+| `INGEST_MODE` | `local` | `local` = write a file; `snowflake` = load the landing table. |
+| `CSV_OUTPUT_DIR` | `data` | Local output directory. |
+| `COIN_IDS` | curated list | The coins to fetch (see below). |
+| `HISTORY_START_DATE` | `2026-01-01` | Backfill start date; end is always the run date. |
+| `COINGECKO_API_KEY` / `COINGECKO_API_PLAN` | unset / `demo` | Optional CoinGecko key; `pro` unlocks history older than 365 days. |
+| `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` | — | Connection identity. |
+| `SNOWFLAKE_PASSWORD` **or** `SNOWFLAKE_PRIVATE_KEY` / `SNOWFLAKE_PRIVATE_KEY_PATH` (+ passphrase) | — | Password **or** key-pair auth. |
+| `SNOWFLAKE_ROLE` / `_WAREHOUSE` / `_DATABASE` / `_SCHEMA` | `CRYPTO_PIPELINE_ROLE` / `CRYPTO_WH` / `CRYPTO_DB` / `STG` | Session context. |
 
-load_dotenv()  # loads ingestion/.env if present — never commit that file
+**Curated coin set** — top market-cap coins plus the major stablecoins, kept small and fixed so runs are deterministic and cheap on the free tier (the backfill makes one API call per coin):
 
-# "local" writes a CSV under CSV_OUTPUT_DIR; "snowflake" loads into Snowflake
-INGEST_MODE = os.getenv("INGEST_MODE", "local")
+`bitcoin, ethereum, binancecoin, solana, ripple, dogecoin, cardano, tron, avalanche-2, chainlink` + stablecoins `tether, usd-coin, dai`.
 
-CSV_OUTPUT_DIR = os.getenv("CSV_OUTPUT_DIR", "data")
+**Output modes** (`ingest_coingecko.py`):
 
-SNOWFLAKE_ACCOUNT   = os.getenv("SNOWFLAKE_ACCOUNT")
-SNOWFLAKE_USER      = os.getenv("SNOWFLAKE_USER")
-SNOWFLAKE_PASSWORD  = os.getenv("SNOWFLAKE_PASSWORD")
-SNOWFLAKE_ROLE      = os.getenv("SNOWFLAKE_ROLE", "CRYPTO_PIPELINE_ROLE")
-SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH")
-SNOWFLAKE_DATABASE  = os.getenv("SNOWFLAKE_DATABASE", "CRYPTO_DB")
-SNOWFLAKE_SCHEMA    = os.getenv("SNOWFLAKE_SCHEMA", "STG")
-```
+- `INGEST_MODE=local` (default) → writes to `ingestion/data/`:
+  - `--format csv` (default) — the trimmed, rounded column set (matches the `COINGECKO_RAW` table).
+  - `--format json` — the **full raw** CoinGecko response, every field, no trimming/rounding. Local only.
+- `INGEST_MODE=snowflake` → loads the trimmed/rounded rows into `CRYPTO_DB.STG.COINGECKO_RAW`. The `--format` flag is ignored.
 
-#### `ingest_coingecko.py`
+Numeric values are rounded to 5 decimals (`transforms.round5`) for the CSV/Snowflake paths.
 
-```python
-# ingestion/ingest_coingecko.py
-import csv
-import os
-from datetime import datetime, timezone
+**Auth:** `snowflake_connection.get_snowflake_conn()` uses key-pair auth when a private key is configured, else password. In CI the ingestion workflows reuse the `DEVELOPER_SVC` key pair and run as `SYSADMIN` (which owns `CRYPTO_DB.STG`). Locally, either put a password in `.env` or point `SNOWFLAKE_PRIVATE_KEY_PATH` at `.keys/rsa_key.p8`.
 
-import requests
-import snowflake.connector
+**Local testing** (details + Windows-CMD/Linux commands in `README.md`): create a venv, `pip install -r ingestion/requirements.txt`, run in `local` mode first to eyeball the CSV/JSON, then flip to `snowflake` mode to verify the write path before trusting the scheduled job.
 
-import config
+**Scheduled workflow — `de-ingest.yml`:** standalone, daily cron (currently `0 1 * * *` = 08:00 Bangkok / 01:00 UTC; GitHub cron is always UTC) plus a manual **Run workflow** button. Runs `ingest_coingecko.py` with `INGEST_MODE=snowflake` and the `DEVELOPER_SVC` key-pair secrets. No `push:` trigger — a code change shouldn't fire a real data load. Kept separate from dbt promotion so it can be retried/read in isolation.
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
-PARAMS = {
-    "vs_currency": "usd",
-    "order": "market_cap_desc",
-    "per_page": 50,
-    "page": 1,
-    "sparkline": False,
-}
+> Note: GitHub only runs a scheduled workflow from the **default branch**, and never backfills a missed slot. Top-of-hour crons (`minute 0`) are the most likely to be delayed/dropped under load — a non-round minute is more reliable.
 
-FIELDNAMES = [
-    "id", "symbol", "name", "current_price", "market_cap", "total_volume",
-    "price_change_24h", "price_change_pct_24h", "high_24h", "low_24h",
-    "circulating_supply", "ath", "fetched_at",
-]
+### Historical backfill (manual)
 
-def fetch_coins():
-    resp = requests.get(COINGECKO_URL, params=PARAMS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+**Files:** `backfill_coingecko_history.py` + `de-ingest-history.yml` (**`workflow_dispatch` only — no schedule**).
 
-def build_rows(coins: list, fetched_at: str) -> list[dict]:
-    return [
-        {
-            "id": c["id"],
-            "symbol": c["symbol"],
-            "name": c["name"],
-            "current_price": c.get("current_price"),
-            "market_cap": c.get("market_cap"),
-            "total_volume": c.get("total_volume"),
-            "price_change_24h": c.get("price_change_24h"),
-            "price_change_pct_24h": c.get("price_change_percentage_24h"),
-            "high_24h": c.get("high_24h"),
-            "low_24h": c.get("low_24h"),
-            "circulating_supply": c.get("circulating_supply"),
-            "ath": c.get("ath"),
-            "fetched_at": fetched_at,
-        }
-        for c in coins
-    ]
+Each run fetches a daily price/market-cap/volume series for every coin in the curated set from `HISTORY_START_DATE` through the run date, and appends to `CRYPTO_DB.STG.COINGECKO_HISTORY_RAW` (or a CSV locally). It reuses the same `fetch_data` / `snowflake_connection` / `transforms` modules and the same `DEVELOPER_SVC` key-pair auth.
 
-def save_to_csv(rows: list[dict], fetched_at: str) -> str:
-    os.makedirs(config.CSV_OUTPUT_DIR, exist_ok=True)
-    stamp = fetched_at.replace("+00:00", "Z").replace(":", "").replace("-", "")
-    path = os.path.join(config.CSV_OUTPUT_DIR, f"coingecko_raw_{stamp}.csv")
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"[local] Wrote {len(rows)} rows to {path}")
-    return path
-
-def get_snowflake_conn():
-    return snowflake.connector.connect(
-        account   = config.SNOWFLAKE_ACCOUNT,
-        user      = config.SNOWFLAKE_USER,
-        password  = config.SNOWFLAKE_PASSWORD,
-        role      = config.SNOWFLAKE_ROLE,
-        warehouse = config.SNOWFLAKE_WAREHOUSE,
-        database  = config.SNOWFLAKE_DATABASE,
-        schema    = config.SNOWFLAKE_SCHEMA,
-    )
-
-def save_to_snowflake(rows: list[dict]) -> None:
-    insert_sql = f"""
-        INSERT INTO {config.SNOWFLAKE_DATABASE}.{config.SNOWFLAKE_SCHEMA}.COINGECKO_RAW (
-            id, symbol, name, current_price, market_cap,
-            total_volume, price_change_24h, price_change_pct_24h,
-            high_24h, low_24h, circulating_supply, ath, fetched_at
-        ) VALUES (
-            %(id)s, %(symbol)s, %(name)s, %(current_price)s, %(market_cap)s,
-            %(total_volume)s, %(price_change_24h)s, %(price_change_pct_24h)s,
-            %(high_24h)s, %(low_24h)s, %(circulating_supply)s, %(ath)s, %(fetched_at)s
-        )
-    """
-    conn = get_snowflake_conn()
-    try:
-        cur = conn.cursor()
-        cur.executemany(insert_sql, rows)
-        conn.commit()
-        print(f"[snowflake] Loaded {len(rows)} rows into "
-              f"{config.SNOWFLAKE_DATABASE}.{config.SNOWFLAKE_SCHEMA}.COINGECKO_RAW")
-    finally:
-        conn.close()
-
-def main():
-    coins = fetch_coins()
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    rows = build_rows(coins, fetched_at)
-
-    if config.INGEST_MODE == "snowflake":
-        save_to_snowflake(rows)
-    else:
-        save_to_csv(rows, fetched_at)
-
-if __name__ == "__main__":
-    main()
-```
-
-```
-# ingestion/requirements.txt
-requests==2.31.0
-snowflake-connector-python==3.13.2
-python-dotenv==1.0.1
-```
-
-#### Local virtual environment & testing
-
-```cmd
-:: Windows cmd, from repo root
-cd de-pipeline
-python -m venv .venv
-.venv\Scripts\activate.bat
-pip install -r ingestion\requirements.txt
-```
-
-```bash
-# Linux / macOS
-cd de-pipeline
-python -m venv .venv
-source .venv/bin/activate
-pip install -r ingestion/requirements.txt
-```
-
-Run in local mode first — no Snowflake credentials needed, output lands in `ingestion/data/coingecko_raw_<timestamp>.csv`:
-
-```cmd
-python ingestion\ingest_coingecko.py
-```
-
-```bash
-python ingestion/ingest_coingecko.py
-```
-
-Once the CSV looks correct, switch to Snowflake mode by setting `INGEST_MODE=snowflake` plus credentials (either export env vars or drop them in `ingestion/.env`, which `config.py` loads automatically via `python-dotenv`):
-
-```
-# ingestion/.env (gitignored — never commit)
-INGEST_MODE=snowflake
-SNOWFLAKE_ACCOUNT=xy12345.us-east-1
-SNOWFLAKE_USER=DEVELOPER_SVC
-SNOWFLAKE_PASSWORD=********
-```
-
-```cmd
-python ingestion\ingest_coingecko.py
-```
-
-```bash
-python ingestion/ingest_coingecko.py
-```
-
-Add `.venv/`, `ingestion/data/`, and `ingestion/.env` to `.gitignore` — none of them should be committed.
-
-#### Scheduled ingestion — `de-ingest.yml`
-
-Production ingestion runs as its **own** GitHub Actions workflow, separate from `de-deploy.yml`. Keeping it standalone means: the daily data pull can be retried on its own without re-running dbt, its logs and run history aren't interleaved with promotion runs, and a change to the ingestion script triggers nothing else. It runs daily at **8:00 AM Bangkok time (ICT, UTC+7)** — `1:00 AM UTC`, since GitHub Actions cron is always specified in UTC and Thailand has no daylight saving to complicate the offset — plus a manual **Run workflow** button.
-
-```yaml
-# .github/workflows/de-ingest.yml
-name: DE Ingest
-
-on:
-  schedule:
-    - cron: '0 1 * * *'   # 1:00 AM UTC = 8:00 AM Bangkok time (ICT, UTC+7, no DST)
-  workflow_dispatch:        # manual run button
-
-jobs:
-  ingest:
-    name: Ingest CoinGecko -> CRYPTO_DB.STG.COINGECKO_RAW
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install -r de-pipeline/ingestion/requirements.txt
-
-      - name: Run ingestion (INGEST_MODE=snowflake)
-        working-directory: de-pipeline/ingestion
-        run: python ingest_coingecko.py
-        env:
-          INGEST_MODE:        snowflake
-          SNOWFLAKE_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER:     ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-```
-
-It authenticates with the same `SNOWFLAKE_USER` / `SNOWFLAKE_PASSWORD` (`CRYPTO_PIPELINE_ROLE`) secrets as the dbt workflows — `config.py` reads them straight from the environment (Step 6). There's no `push:` trigger: the script's behaviour doesn't change on merge, only on the schedule, so a code push doesn't need to fire a real data load.
+**CoinGecko 365-day limit:** the keyless/Demo API only serves the past 365 days of `market_chart` history. The default start (`2026-01-01`) stays inside that window so it works keyless. Going further back requires a **paid** plan — set `COINGECKO_API_KEY` + `COINGECKO_API_PLAN=pro`; otherwise the script exits early with a clear message. The workflow exposes a `history_start_date` input for one-off ranges.
 
 ### 3b. Snowflake Python Task ingestion (disabled — kept for later)
 
-**Status: not in use.** This was designed as a from-inside-Snowflake alternative to 3a — a Snowflake Task calling a Python stored procedure (Snowpark) that fetches CoinGecko and appends straight into `CRYPTO_DB.STG.COINGECKO_RAW`. It requires an **External Access Integration** for network egress to `api.coingecko.com`, and creating one needs the global `CREATE INTEGRATION` privilege — which is not available on the Snowflake trial account this project was built against. Rather than delete the work, the file stays in the repo with its SQL commented out, and is **not** included in `infra-deploy.yml`'s applied-file list, so it has zero effect on the running pipeline. Production ingestion is 3a (`de-ingest.yml`, GitHub Actions cron) instead.
+`snowflake/ingest_task.sql` would fetch CoinGecko from inside Snowflake (a Snowpark stored proc on a Task). It needs an **External Access Integration** (requires the account-level `CREATE INTEGRATION` privilege), which the trial account can't create — so its SQL is **fully commented out** and it's **excluded** from `infra-deploy.yml`'s applied-file list, giving it zero effect on the running pipeline.
 
-The full commented-out file is at [`snowflake/ingest_task.sql`](../de-pipeline/snowflake/ingest_task.sql); its header documents the exact steps to re-enable it (create the network rule + integration + `USAGE` grant as `ACCOUNTADMIN`, uncomment the body, add it to `run_sql.py`'s file list in `infra-deploy.yml`, and decide whether to retire `de-ingest.yml` so the two don't double-insert).
-
-If it's ever re-enabled, rows it appends would still flow through the existing `STREAM_COINGECKO_RAW` / `TASK_NOTIFY_NEW_DATA` from Step 2 unchanged — that stream tracks inserts on the table regardless of what inserted them.
+The file's header documents how to re-enable it later (create the network rule + integration + `USAGE` grant as `ACCOUNTADMIN`, uncomment, add it to `run_sql.py`'s file list, and retire `de-ingest.yml` so the two don't double-insert). If re-enabled, its inserts still flow through the Step 2 stream unchanged.
 
 ---
 
 ## Deployment Step-1 — CI/CD for the Snowflake infra scripts (Steps 1–2)
 
-`infra-ci.yml` / `infra-deploy.yml` deploy **only** `snowflake/setup.sql`, `streams.sql`, and `tasks.sql` — the infra created in Steps 1–2. `ingest_task.sql` (Step 3b) is deliberately **not** in this list — it's disabled (see 3b), and its SQL is fully commented out, so there's nothing for `infra-deploy.yml` to apply. This is separate from `de-ci.yml` / `de-deploy.yml` (Step 5, dbt) and `de-ingest.yml` (Step 3a, ingestion). Splitting them means an infra change (e.g. a new schema), a dbt change (e.g. a new mart), and an ingestion change each trigger independent, correctly-scoped pipelines.
+Two workflows deploy **only** the infra SQL (`setup.sql`, `streams.sql`, `tasks.sql`), separate from the dbt pipeline (Step 5) and from ingestion (Step 3a) — so an infra change, a dbt change, and an ingestion change each trigger their own correctly-scoped pipeline. `ingest_task.sql` (Step 3b) is excluded (disabled).
 
-- **CI does not touch real Snowflake.** It runs `sqlfluff parse` against the SQL — a genuine syntax check (catches malformed DDL) without needing credentials in a PR context, which matters once forks can open PRs.
-- **Deploy actually applies the SQL to Snowflake**, using the `DEVELOPER_SVC` key-pair service account from `README.md` (`SYSADMIN` + `USERADMIN`) via a small connector script, since GitHub's `ubuntu-latest` runners don't ship SnowSQL.
-- All three scripts are safe to re-run: `setup.sql` uses `CREATE ... IF NOT EXISTS` throughout, and `streams.sql` was changed from `CREATE OR REPLACE STREAM` to `CREATE STREAM IF NOT EXISTS` specifically so repeat deploys don't reset the stream's tracked offset.
-- If Step 3b is ever re-enabled, add `ingest_task.sql` back to the `run_sql.py` file list below — but only after its `ACCOUNTADMIN` prerequisites exist, or `CREATE PROCEDURE` will fail every deploy (it references an integration that must already exist at creation time).
+- **`infra-ci.yml`** — on PRs touching `de-pipeline/snowflake/**`, runs `sqlfluff parse` (parse-only, not lint) against the SQL. A real syntax check that needs **no** Snowflake credentials, so it's safe for fork PRs and doesn't impose a formatting style. Dialect is pinned by the repo-root `.sqlfluff` (`dialect = snowflake`).
+- **`infra-deploy.yml`** — on merge to `main` (and manual dispatch), applies the SQL to Snowflake via `run_sql.py`, authenticating as the `DEVELOPER_SVC` key pair (GitHub `ubuntu-latest` runners don't ship SnowSQL). Gated by a GitHub `infra` environment for optional required-reviewer approval.
+- **`run_sql.py`** — a small connector script: loads the PEM private key → DER, connects, and executes each `;`-separated statement from the given files in order. Same key-pair approach as `snowflake_connection.py`.
 
-### `run_sql.py` — applies SQL files via key-pair auth
+All scripts are safe to re-run (idempotent `IF NOT EXISTS`; the stream deliberately avoids `OR REPLACE`). Remember the one-time `ACCOUNTADMIN` grants from Step 1 must exist first, or the `GRANT ... ON FUTURE` / `ALTER TASK ... RESUME` statements fail.
 
-```python
-# snowflake/run_sql.py
-import argparse
-import os
-import sys
-
-import snowflake.connector
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
-
-
-def load_private_key_der(pem: str, passphrase: str | None) -> bytes:
-    key = serialization.load_pem_private_key(
-        pem.encode(),
-        password=passphrase.encode() if passphrase else None,
-        backend=default_backend(),
-    )
-    return key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-
-
-def get_connection():
-    return snowflake.connector.connect(
-        account            = os.environ["SNOWFLAKE_ACCOUNT"],
-        user               = os.environ["SNOWFLAKE_DEV_SVC_USER"],
-        private_key        = load_private_key_der(
-            os.environ["SNOWFLAKE_DEV_SVC_PRIVATE_KEY"],
-            os.environ.get("SNOWFLAKE_DEV_SVC_PRIVATE_KEY_PASSPHRASE"),
-        ),
-        warehouse          = os.environ.get("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH"),
-    )
-
-
-def run_file(cur, path: str) -> None:
-    with open(path, "r", encoding="utf-8") as f:
-        sql = f.read()
-
-    statements = [s.strip() for s in sql.split(";")]
-    for statement in statements:
-        if not statement:
-            continue
-        code_lines = [
-            line for line in statement.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
-        preview = code_lines[0][:80] if code_lines else statement.splitlines()[0][:80]
-        print(f"  -> {preview}")
-        cur.execute(statement)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Apply Snowflake infra SQL files in order")
-    parser.add_argument("files", nargs="+", help="SQL files to run, in order")
-    args = parser.parse_args()
-
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        for path in args.files:
-            print(f"=== Running {path} ===")
-            run_file(cur, path)
-    finally:
-        conn.close()
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-```
-
-```
-# snowflake/requirements.txt
-snowflake-connector-python==3.13.2
-cryptography==42.0.5
-```
-
-### CI — syntax-check on every pull request
-
-```yaml
-# .github/workflows/infra-ci.yml
-name: Infra CI
-
-on:
-  pull_request:
-    branches: [main]
-    paths:
-      - 'de-pipeline/snowflake/**'
-
-jobs:
-  sql-syntax-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install sqlfluff
-        run: pip install sqlfluff==3.1.1
-
-      # Parse-only, not lint: this catches real syntax errors without
-      # requiring Snowflake credentials in a PR context (safer for forks)
-      # and without forcing a specific formatting style on the DDL.
-      - name: Validate Snowflake SQL syntax
-        run: sqlfluff parse de-pipeline/snowflake --dialect snowflake
-```
-
-`.sqlfluff` at the repo root pins the dialect so both this workflow and local runs agree:
-
-```ini
-[sqlfluff]
-dialect = snowflake
-templater = raw
-```
-
-### Deploy — apply to Snowflake on merge to main
-
-```yaml
-# .github/workflows/infra-deploy.yml
-name: Infra Deploy
-
-on:
-  push:
-    branches: [main]
-    paths:
-      - 'de-pipeline/snowflake/**'
-  workflow_dispatch:
-
-jobs:
-  deploy-snowflake-infra:
-    name: Apply setup.sql, streams.sql, tasks.sql
-    runs-on: ubuntu-latest
-    environment: infra   # configure required reviewers: Settings -> Environments -> infra
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install -r de-pipeline/snowflake/requirements.txt
-
-      - name: Apply Snowflake infra
-        working-directory: de-pipeline/snowflake
-        run: python run_sql.py setup.sql streams.sql tasks.sql
-        env:
-          SNOWFLAKE_ACCOUNT:             ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_DEV_SVC_USER:        ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
-          SNOWFLAKE_DEV_SVC_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
-```
-
-`environment: infra` gates this the same way `qa`/`prod` are gated in `de-deploy.yml` (Step 5) — add required reviewers under **Settings → Environments → infra** if infra changes should need manual approval before hitting Snowflake.
-
-New secrets needed (see updated Step 6): `SNOWFLAKE_DEV_SVC_USER` and `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` hold the `DEVELOPER_SVC` key-pair credentials from `README.md` — the contents of `.keys/rsa_key.p8`, not the `CRYPTO_PIPELINE_ROLE` password used by `de-deploy.yml`. These are different accounts with different privileges (`SYSADMIN`/`USERADMIN` for infra vs. `CRYPTO_PIPELINE_ROLE` for data) and should stay separate.
+**Secrets used:** `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_DEV_SVC_USER`, `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` (the `DEVELOPER_SVC` key-pair credentials — see Step 6 and `README.md`).
 
 ---
 
@@ -1064,7 +617,7 @@ Ingestion and dbt promotion are two independent workflows on staggered daily sch
 │
 └── Job: ingest
       └── ingest_coingecko.py runs (INGEST_MODE=snowflake)
-            └── 50 rows → CRYPTO_DB.STG.COINGECKO_RAW
+            └── rows → CRYPTO_DB.STG.COINGECKO_RAW
                   └── STREAM_COINGECKO_RAW captures new rows
                         └── TASK_NOTIFY_NEW_DATA fires (signal only)
 
@@ -1088,7 +641,7 @@ Ingestion and dbt promotion are two independent workflows on staggered daily sch
       └── dbt test      → all schema tests must pass or job fails
 ```
 
-Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.yml` (Deployment Step-1) independently, applying `setup.sql`/`streams.sql`/`tasks.sql`. `ingest_task.sql` (Step 3b) is excluded — it's disabled and has no effect until re-enabled.
+The manual `de-ingest-history.yml` backfill (Step 3a) runs on demand, appending to `CRYPTO_DB.STG.COINGECKO_HISTORY_RAW`. Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.yml` (Deployment Step-1) independently, applying `setup.sql`/`streams.sql`/`tasks.sql`. `ingest_task.sql` (Step 3b) is excluded — it's disabled and has no effect until re-enabled.
 
 ---
 
@@ -1104,7 +657,9 @@ Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.
 
 **Append-only landing table.** Raw data in `CRYPTO_DB.STG.COINGECKO_RAW` is never modified — every run appends rows with `fetched_at`. This gives a complete audit trail and lets you rebuild Silver/Gold in any environment from any past point in time.
 
-**Production ingestion runs via GitHub Actions, not a Snowflake Task — for now.** A Snowflake-native Python Task (Step 3b, `ingest_task.sql`) was built and is kept in the repo, but it needs an External Access Integration, which requires the `CREATE INTEGRATION` privilege — unavailable on the Snowflake trial account this project runs on. Rather than block on that, ingestion reverted to `ingest_coingecko.py`. `ingest_task.sql`'s SQL is fully commented out and excluded from `infra-deploy.yml`'s file list, so it has zero effect until the account is upgraded and someone deliberately re-enables it (instructions are in Step 3b's comment header).
+**Shared, modularized ingestion code.** `fetch_data.py`, `snowflake_connection.py`, and `transforms.py` hold the common concerns (API access, connection/auth, rounding) so the daily snapshot and the historical backfill reuse one implementation instead of duplicating it.
+
+**Production ingestion runs via GitHub Actions, not a Snowflake Task — for now.** A Snowflake-native Python Task (Step 3b, `ingest_task.sql`) was built and is kept in the repo, but it needs an External Access Integration, which requires the `CREATE INTEGRATION` privilege — unavailable on the Snowflake trial account this project runs on. Rather than block on that, ingestion runs `ingest_coingecko.py`. `ingest_task.sql`'s SQL is fully commented out and excluded from `infra-deploy.yml`'s file list, so it has zero effect until the account is upgraded and someone deliberately re-enables it (instructions are in Step 3b's comment header).
 
 **Ingestion is a standalone workflow, decoupled from dbt promotion.** `de-ingest.yml` (Step 3a) runs `ingest_coingecko.py` on its own daily cron; `de-deploy.yml` (Step 5) runs dbt on a separate cron staggered 30 minutes later. Splitting them — rather than making ingestion a first job inside `de-deploy.yml` — means each can be retried, rerun, and read in isolation, and a flaky data pull doesn't show up as a "deploy" failure. The tradeoff is there's no hard `needs:` ordering across the two workflows (GitHub Actions can't express that cleanly); the 30-minute stagger is a deliberately loose coupling, and because Silver is incremental, a missed or late ingestion just means that day's dbt run merges fewer new rows rather than breaking.
 
