@@ -6,7 +6,8 @@ name: DE Ingest
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # 1:00 AM UTC = 8:00 AM Bangkok time (ICT, UTC+7, no DST)
+    # - cron: '0 1 * * *'   # 1:00 AM UTC = 8:00 AM Bangkok time (ICT, UTC+7, no DST)
+    - cron: '8 1,7,13,19 * * *'
   workflow_dispatch:        # manual run button
 
 jobs:
