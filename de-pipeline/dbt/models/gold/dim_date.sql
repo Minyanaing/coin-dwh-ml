@@ -1,14 +1,21 @@
 {{ config(materialized='table') }}
 
 -- Calendar date dimension. Keyed by an integer surrogate key (YYYYMMDD).
--- A static spine from 2024-01-01 to today comfortably covers all data.
+-- Static spine from 2024-01-01 to a few days past today.
+--
+-- The forward buffer matters: facts derive price_date from fetched_at (UTC),
+-- while current_date is evaluated in the session timezone. When the session TZ
+-- is behind UTC, the latest UTC date can be one day ahead of current_date — so
+-- the spine must extend past today, or the newest day's rows have no matching
+-- date_sk and the fact FK tests fail. A small buffer (extra future dates are
+-- harmless in a calendar dimension) removes any TZ off-by-one.
 
 with spine as (
 
     {{ dbt_utils.date_spine(
         datepart="day",
-        start_date="cast('2024-01-01' as date)",
-        end_date="dateadd(day, 1, current_date)"
+        start_date="cast('2026-01-01' as date)",
+        end_date="dateadd(day, 3, current_date())"
     ) }}
 
 )

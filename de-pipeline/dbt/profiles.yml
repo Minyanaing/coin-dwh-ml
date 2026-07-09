@@ -1,14 +1,21 @@
 # Development targets DEV_DB only. QA / PROD promotion targets are added in a
 # later deployment step — during development, all dbt runs land in dev_db.
+#
+# Auth: key-pair as the DEVELOPER_SVC service account (the same account + key
+# used for the Snowflake infra setup). DEVELOPER_SVC is TYPE=SERVICE, so it has
+# no password — only key-pair. Its usable role is SYSADMIN, which owns DEV_DB
+# and CRYPTO_DB.STG, so it can read the landing tables and build
+# silver_crypto / gold_crypto.
 crypto_pipeline:
   target: dev
   outputs:
     dev:
       type: snowflake
       account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
-      user: "{{ env_var('SNOWFLAKE_USER') }}"
-      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
-      role: "{{ env_var('SNOWFLAKE_ROLE', 'CRYPTO_PIPELINE_ROLE') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"                                        # DEVELOPER_SVC
+      authenticator: snowflake_jwt
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH', '../.keys/rsa_key.p8') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
       warehouse: CRYPTO_WH
       database: DEV_DB
       schema: PUBLIC          # overridden per-layer by generate_schema_name (silver_crypto / gold_crypto)

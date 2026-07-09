@@ -36,13 +36,21 @@ models:
           combination_of_columns: [coin_id, price_date]
 
   - name: int_coin_daily
-    description: "Unified daily grain per coin (history authoritative; snapshot-derived close for recent days)."
+    description: >
+      Unified daily grain per coin. Carries the day's average across its
+      6-hourly extracts (avg_*) and the latest extract's values (latest_*),
+      plus extract_count. Snapshot feed wins on overlap; history fills days with
+      no snapshots (avg = latest, extract_count = 1).
     columns:
       - name: coin_id
         tests: [not_null]
       - name: price_date
         tests: [not_null]
-      - name: close_price_usd
+      - name: extract_count
+        tests: [not_null]
+      - name: avg_price_usd
+        tests: [not_null]
+      - name: latest_price_usd
         tests: [not_null]
     tests:
       - dbt_utils.unique_combination_of_columns:

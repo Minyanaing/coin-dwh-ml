@@ -6,17 +6,20 @@
   )
 }}
 
--- Unified daily grain per coin, combining both landing feeds:
---   * the historical backfill is the authoritative daily close;
---   * for recent days only covered by the 6-hourly snapshots, the day's close
---     is the last intraday observation (MAX_BY on fetched_at).
--- History wins whenever a day exists in both.
+-- Daily grain per coin. The 6-hourly snapshot feed can land several extracts in
+-- a single day, so for every (coin, price_date) we compute BOTH:
+--   * the day's AVERAGE across all of that day's extracts, and
+--   * the value of the LATEST extract of the day,
+-- plus extract_count (how many extracts fed the average).
+-- The historical backfill has a single value per day, so for a history-only day
+-- avg == latest and extract_count = 1 (one extract -> its own average).
 --
--- Incremental: each run recomputes only the (coin_id, price_date) days that
--- received new source rows since the last run — but recomputes each such day
--- from ALL of its source rows, so the current day's evolving close and any
--- late-arriving backfilled day both resolve correctly (no history/snapshot
--- priority inversion). `_synced_at` is the watermark (max source fetched_at).
+-- When a day exists in both feeds the intraday snapshot wins (it's what the
+-- averages are about); history only fills days that have no snapshots.
+--
+-- Incremental: recompute only the (coin_id, price_date) days with new source
+-- rows since the last run (`_synced_at` watermark), each from ALL of that day's
+-- rows — so the average and the latest are always computed over the full day.
 
 with snap as (
     select
@@ -48,12 +51,16 @@ snapshot_daily as (
     select
         coin_id,
         price_date,
-        max_by(symbol, fetched_at)         as symbol,
-        max_by(name, fetched_at)           as name,
-        max_by(price_usd, fetched_at)      as close_price_usd,
-        max_by(market_cap_usd, fetched_at) as market_cap_usd,
-        max_by(volume_24h_usd, fetched_at) as volume_usd,
-        max(fetched_at)                    as _synced_at
+        max_by(symbol, fetched_at)               as symbol,
+        max_by(name, fetched_at)                 as name,
+        count(*)                                 as extract_count,
+        round(avg(price_usd), 8)                 as avg_price_usd,
+        round(avg(market_cap_usd), 2)            as avg_market_cap_usd,
+        round(avg(volume_24h_usd), 2)            as avg_volume_usd,
+        max_by(price_usd, fetched_at)            as latest_price_usd,
+        max_by(market_cap_usd, fetched_at)       as latest_market_cap_usd,
+        max_by(volume_24h_usd, fetched_at)       as latest_volume_usd,
+        max(fetched_at)                          as _synced_at
     from snap
     {% if is_incremental() %}
     where (coin_id, price_date) in (select coin_id, price_date from touched)
@@ -62,15 +69,20 @@ snapshot_daily as (
 ),
 
 history_daily as (
+    -- single value per (coin, day): avg == latest, one "extract"
     select
         coin_id,
         price_date,
         symbol,
         name,
-        price_usd     as close_price_usd,
-        market_cap_usd,
-        volume_usd,
-        fetched_at    as _synced_at
+        1                as extract_count,
+        price_usd        as avg_price_usd,
+        market_cap_usd   as avg_market_cap_usd,
+        volume_usd       as avg_volume_usd,
+        price_usd        as latest_price_usd,
+        market_cap_usd   as latest_market_cap_usd,
+        volume_usd       as latest_volume_usd,
+        fetched_at       as _synced_at
     from hist
     {% if is_incremental() %}
     where (coin_id, price_date) in (select coin_id, price_date from touched)
@@ -78,9 +90,19 @@ history_daily as (
 ),
 
 unioned as (
-    select coin_id, symbol, name, price_date, close_price_usd, market_cap_usd, volume_usd, _synced_at, 'history'  as source_name from history_daily
+    select
+        coin_id, price_date, symbol, name, extract_count,
+        avg_price_usd, avg_market_cap_usd, avg_volume_usd,
+        latest_price_usd, latest_market_cap_usd, latest_volume_usd,
+        _synced_at, 'snapshot' as source_name
+    from snapshot_daily
     union all
-    select coin_id, symbol, name, price_date, close_price_usd, market_cap_usd, volume_usd, _synced_at, 'snapshot' as source_name from snapshot_daily
+    select
+        coin_id, price_date, symbol, name, extract_count,
+        avg_price_usd, avg_market_cap_usd, avg_volume_usd,
+        latest_price_usd, latest_market_cap_usd, latest_volume_usd,
+        _synced_at, 'history' as source_name
+    from history_daily
 ),
 
 prioritized as (
@@ -88,7 +110,7 @@ prioritized as (
         *,
         row_number() over (
             partition by coin_id, price_date
-            order by case when source_name = 'history' then 0 else 1 end
+            order by case when source_name = 'snapshot' then 0 else 1 end
         ) as _priority
     from unioned
 )
@@ -98,9 +120,13 @@ select
     symbol,
     name,
     price_date,
-    close_price_usd,
-    market_cap_usd,
-    volume_usd,
+    extract_count,
+    avg_price_usd,
+    avg_market_cap_usd,
+    avg_volume_usd,
+    latest_price_usd,
+    latest_market_cap_usd,
+    latest_volume_usd,
     source_name,
     _synced_at
 from prioritized

@@ -7,9 +7,10 @@
 }}
 
 -- Fact: one row per coin per day, from the unified daily grain (int_coin_daily).
--- The day-over-day return is computed with a window over the FULL per-coin
--- series (so lag() sees the prior day even on incremental runs); only rows
--- whose source data changed since the last run (_synced_at) are then merged.
+-- Carries both the day's AVERAGE across its 6-hourly extracts and the value of
+-- the LATEST extract, plus how many extracts fed the average (extract_count).
+-- The day-over-day return is computed on the latest (close) price with lag()
+-- over the FULL per-coin series, so it's correct even on incremental runs.
 -- coin_sk is resolved via an SCD Type-2 range join to dim_coin.
 
 with daily as (
@@ -24,13 +25,17 @@ with_returns as (
     select
         coin_id,
         price_date,
-        close_price_usd,
-        market_cap_usd,
-        volume_usd,
+        extract_count,
+        avg_price_usd,
+        avg_market_cap_usd,
+        avg_volume_usd,
+        latest_price_usd,
+        latest_market_cap_usd,
+        latest_volume_usd,
         _synced_at,
-        lag(close_price_usd) over (
+        lag(latest_price_usd) over (
             partition by coin_id order by price_date
-        ) as prev_close_price_usd
+        ) as prev_latest_price_usd
     from daily
 
 )
@@ -40,12 +45,18 @@ select
     dc.coin_sk,                                                -- FK -> dim_coin (version in effect)
     to_number(to_char(wr.price_date, 'YYYYMMDD'))  as date_sk, -- FK -> dim_date
     wr.price_date,
-    wr.close_price_usd,
-    wr.prev_close_price_usd,
-    wr.market_cap_usd,
-    wr.volume_usd,
+    wr.extract_count,
+    -- day average across the extracts
+    wr.avg_price_usd,
+    wr.avg_market_cap_usd,
+    wr.avg_volume_usd,
+    -- value of the latest extract of the day
+    wr.latest_price_usd,
+    wr.latest_market_cap_usd,
+    wr.latest_volume_usd,
+    wr.prev_latest_price_usd,
     round(
-        (wr.close_price_usd - wr.prev_close_price_usd) / nullif(wr.prev_close_price_usd, 0) * 100, 4
+        (wr.latest_price_usd - wr.prev_latest_price_usd) / nullif(wr.prev_latest_price_usd, 0) * 100, 4
     ) as daily_return_pct,
     wr._synced_at   -- incremental watermark
 from with_returns wr

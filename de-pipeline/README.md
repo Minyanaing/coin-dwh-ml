@@ -211,8 +211,9 @@ The dbt project lives in [`dbt/`](dbt/) and builds the medallion → star schema
 
 **Prerequisites:**
 
-1. `snowflake/setup.sql` has been applied, so `DEV_DB.SILVER_CRYPTO` / `DEV_DB.GOLD_CRYPTO` and `CRYPTO_PIPELINE_ROLE` already exist. dbt **uses** those schemas — it does not create them.
-2. There is raw data in `CRYPTO_DB.STG` to transform — run the ingestion in Snowflake mode first (section 2.3), otherwise Silver/Gold build empty.
+1. `snowflake/setup.sql` has been applied, so `DEV_DB.SILVER_CRYPTO` / `DEV_DB.GOLD_CRYPTO` already exist. dbt **uses** those schemas — it does not create them.
+2. You have the `DEVELOPER_SVC` private key locally (`.keys/rsa_key.p8` from section 1.1) — dbt authenticates with it.
+3. There is raw data in `CRYPTO_DB.STG` to transform — run the ingestion in Snowflake mode first (section 2.3), otherwise Silver/Gold build empty.
 
 ### 3.1 Install dbt
 
@@ -234,34 +235,37 @@ pip install dbt-snowflake==1.7.0
 
 ### 3.2 Set the connection environment variables
 
-`dbt/profiles.yml` resolves the connection from these variables via `env_var()`:
+`dbt/profiles.yml` authenticates as **`DEVELOPER_SVC` via key-pair** (the same account and key from section 1) and resolves the connection from these variables via `env_var()`:
 
 | Env var | Required | Purpose |
 |---|---|---|
 | `SNOWFLAKE_ACCOUNT` | yes | Account identifier, e.g. `xy12345.us-east-1` |
-| `SNOWFLAKE_USER` | yes | A **password-login** Snowflake user that has `CRYPTO_PIPELINE_ROLE` |
-| `SNOWFLAKE_PASSWORD` | yes | That user's password |
-| `SNOWFLAKE_ROLE` | no (default `CRYPTO_PIPELINE_ROLE`) | Role dbt builds as |
+| `SNOWFLAKE_USER` | yes | `DEVELOPER_SVC` |
+| `SNOWFLAKE_PRIVATE_KEY_PATH` | no (default `../.keys/rsa_key.p8`) | Path to the private key `.p8` from section 1.1 |
+| `SNOWFLAKE_ROLE` | no (default `SYSADMIN`) | Role dbt builds as |
 
-> Use a real login user here — **not** `DEVELOPER_SVC`, which is `TYPE = SERVICE` (key-pair only, no password). Grant your dev login the role once: `GRANT ROLE CRYPTO_PIPELINE_ROLE TO USER <your_login>;`
-> The warehouse (`CRYPTO_WH`) and database (`DEV_DB`) are pinned in `profiles.yml`, so they don't need env vars.
+> `DEVELOPER_SVC` is `TYPE = SERVICE` — key-pair only, no password — so there's **no** `SNOWFLAKE_PASSWORD` here. Its usable role is `SYSADMIN`, which owns `DEV_DB` and `CRYPTO_DB.STG`, so it can read the landing tables and build the Silver/Gold schemas. (A dedicated least-privilege key-pair user with `CRYPTO_PIPELINE_ROLE` is the tidier long-term option, but reusing `DEVELOPER_SVC` keeps one credential for dev.)
+> The default key path is relative to `de-pipeline/dbt/`, so it resolves when you run dbt from there (section 3.3). Set an absolute `SNOWFLAKE_PRIVATE_KEY_PATH` if you run from elsewhere. Warehouse (`CRYPTO_WH`) and database (`DEV_DB`) are pinned in `profiles.yml`.
 
 ```cmd
 :: Windows cmd — session-scoped; re-run in each new shell
 set SNOWFLAKE_ACCOUNT=xy12345.us-east-1
-set SNOWFLAKE_USER=your_dev_login
-set SNOWFLAKE_PASSWORD=your_password
-set SNOWFLAKE_ROLE=CRYPTO_PIPELINE_ROLE
+set SNOWFLAKE_USER=DEVELOPER_SVC
+:: optional — defaults shown
+set SNOWFLAKE_PRIVATE_KEY_PATH=..\.keys\rsa_key.p8
+set SNOWFLAKE_ROLE=SYSADMIN
 ```
 
 ```bash
 # Linux / macOS — session-scoped; add to ~/.bashrc / ~/.zshrc to persist
 export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
-export SNOWFLAKE_USER=your_dev_login
-export SNOWFLAKE_PASSWORD='your_password'
-export SNOWFLAKE_ROLE=CRYPTO_PIPELINE_ROLE   # optional
+export SNOWFLAKE_USER=DEVELOPER_SVC
+# optional — defaults shown
+export SNOWFLAKE_PRIVATE_KEY_PATH=../.keys/rsa_key.p8
+export SNOWFLAKE_ROLE=SYSADMIN
 ```
 
+> If your key is encrypted (a passphrase-protected `.p8`), also add a `private_key_passphrase` line to `profiles.yml`. The section-1.1 key is generated unencrypted (`-nocrypt`), so none is needed here.
 > dbt reads OS environment variables directly — it does **not** load `ingestion/.env` (that file is only for the Python ingestion via `python-dotenv`).
 
 ### 3.3 Verify the connection
