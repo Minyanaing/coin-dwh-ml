@@ -17,73 +17,20 @@ import os
 import time
 from datetime import datetime, timezone
 
-import requests
-
 import config
-from ingest_coingecko import fetch_coins, get_snowflake_conn
+from fetch_data import REQUEST_SLEEP_SECONDS, fetch_coins, fetch_history
+from snowflake_connection import get_snowflake_conn
+from transforms import round5
 
 FIELDNAMES = [
     "id", "symbol", "name", "price_date",
     "price", "market_cap", "total_volume", "fetched_at",
 ]
 
-# The public CoinGecko API rate-limits aggressively; go gently and back off on 429.
-REQUEST_SLEEP_SECONDS = 2.5
-MAX_RETRIES = 5
-
 
 def _to_unix(dt: datetime) -> int:
     return int(dt.timestamp())
 
-
-def _base_and_headers() -> tuple[str, dict]:
-    """Pick the CoinGecko host + auth header based on config.
-
-    - No key         -> public host, no header (capped at the past 365 days).
-    - Demo key        -> public host, x-cg-demo-api-key (still capped at 365 days).
-    - Pro  key        -> pro host, x-cg-pro-api-key (full history from 2013).
-    """
-    key = config.COINGECKO_API_KEY
-    if not key:
-        return "https://api.coingecko.com/api/v3", {}
-    if config.COINGECKO_API_PLAN == "pro":
-        return "https://pro-api.coingecko.com/api/v3", {"x-cg-pro-api-key": key}
-    return "https://api.coingecko.com/api/v3", {"x-cg-demo-api-key": key}
-
-
-def fetch_history(coin_id: str, start_ts: int, end_ts: int) -> dict:
-    """Daily market_chart for one coin. A range wider than 90 days makes
-    CoinGecko return daily-granularity points automatically."""
-    base, headers = _base_and_headers()
-    url = f"{base}/coins/{coin_id}/market_chart/range"
-    params = {"vs_currency": "usd", "from": start_ts, "to": end_ts}
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        resp = requests.get(url, params=params, headers=headers, timeout=60)
-        if resp.status_code == 429:
-            wait = REQUEST_SLEEP_SECONDS * 2 ** attempt
-            print(f"  rate-limited on {coin_id}, retry {attempt}/{MAX_RETRIES} in {wait:.0f}s")
-            time.sleep(wait)
-            continue
-        if resp.status_code in (401, 403):
-            raise SystemExit(
-                f"\nCoinGecko returned {resp.status_code} for '{coin_id}' over "
-                f"{config.HISTORY_START_DATE}..today.\n"
-                "The keyless/Demo API only serves the past 365 days of market_chart "
-                "history, so a start date older than that is rejected.\n"
-                "Either move HISTORY_START_DATE within the last 365 days, or set "
-                "COINGECKO_API_KEY and COINGECKO_API_PLAN=pro (a PAID plan) for full history."
-            )
-        resp.raise_for_status()
-        return resp.json()
-
-    resp.raise_for_status()  # exhausted retries — surface the last 429
-    return {}
-
-
-def _round5(value):
-    """Round numeric API values to 5 decimals; pass None through untouched."""
-    return round(value, 5) if value is not None else None
 
 def build_history_rows(coin: dict, payload: dict, fetched_at: str) -> list[dict]:
     def by_date(pairs):
@@ -105,9 +52,9 @@ def build_history_rows(coin: dict, payload: dict, fetched_at: str) -> list[dict]
             "symbol": coin["symbol"],
             "name": coin["name"],
             "price_date": day,
-            "price": _round5(prices.get(day)),
-            "market_cap": _round5(market_caps.get(day)),
-            "total_volume": _round5(total_volumes.get(day)),
+            "price": round5(prices.get(day)),
+            "market_cap": round5(market_caps.get(day)),
+            "total_volume": round5(total_volumes.get(day)),
             "fetched_at": fetched_at,
         }
         for day in sorted(prices)
