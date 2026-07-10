@@ -1,4 +1,4 @@
-name: DBT
+name: dbt dev
 
 # Runs the dbt project against DEV_DB on a GitHub-hosted ubuntu runner.
 # Three ways in:
