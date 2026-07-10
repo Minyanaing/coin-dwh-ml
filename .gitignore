@@ -21,3 +21,5 @@ de-pipeline/dbt/.user.yml
 
 # github action
 # .github/
+
+.claude/

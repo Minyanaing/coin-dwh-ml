@@ -304,3 +304,28 @@ Handy subsets while developing (all from `de-pipeline/dbt/`, all take `--profile
 | `dbt docs generate` then `dbt docs serve` | browse the lineage graph + docs locally |
 
 Everything targets `DEV_DB` only. Promotion to `QA_DB` / `PROD_DB` is a later step and isn't part of local development.
+
+### 3.5 Full refresh — reload the whole pipeline (truncate & load)
+
+Normal runs are **incremental** — each model processes only new rows. When you need to rebuild everything from source (schema change, backfilled/corrected raw data, or just a clean slate), pass `--full-refresh`. dbt then **drops and recreates** each incremental table and reloads it in full from the landing tables — the truncate-and-load of the whole pipeline:
+
+```cmd
+:: Windows cmd — from de-pipeline/dbt
+dbt build --full-refresh --target dev --profiles-dir .
+```
+
+```bash
+# Linux / macOS — from de-pipeline/dbt
+dbt build --full-refresh --target dev --profiles-dir .
+```
+
+This fully reloads the incremental models (`stg_coingecko_snapshot`, `stg_coingecko_history`, `int_coin_daily`, `fct_market_snapshot`, `fct_daily_market`); the plain tables (`dim_coin`, `dim_date`) are rebuilt every run anyway. Scope it to part of the DAG the same way as a normal build, e.g. `dbt build --full-refresh --select silver+`.
+
+**Snapshots are the exception.** `--full-refresh` does **not** rebuild the SCD Type-2 `snap_coin` snapshot — its history is meant to persist across runs. If you want a *true* from-scratch reset that also wipes SCD2 history, drop the snapshot first (a `reset_snapshots` operation macro is included), then full-refresh:
+
+```bash
+dbt run-operation reset_snapshots --target dev --profiles-dir .   # drops snap_coin — discards SCD2 history
+dbt build --full-refresh --target dev --profiles-dir .            # rebuilds everything, snapshot re-initializes
+```
+
+> Skip `reset_snapshots` unless you specifically want to lose the accumulated coin-attribute history — a normal `--full-refresh` already reloads all the actual data.
