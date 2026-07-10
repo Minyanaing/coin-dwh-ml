@@ -1,0 +1,89 @@
+name: dbt (dev)
+
+# Runs the dbt project against DEV_DB on a GitHub-hosted ubuntu runner.
+# Three ways in:
+#   * pull_request touching de-pipeline/dbt/**  -> "dbt CI": dbt build + tests
+#                                                   (validates the change; note it
+#                                                   builds into the shared DEV_DB
+#                                                   schemas — no per-PR isolation,
+#                                                   since create_schema is a no-op).
+#   * push to main touching de-pipeline/dbt/**   -> build DEV_DB (deploy the merge).
+#   * workflow_dispatch / repository_dispatch    -> the scheduled daily run, fired
+#                                                   externally by cron-job.org
+#                                                   (GitHub's built-in cron is
+#                                                   unreliable — see Step 5b).
+#
+# cron-job.org POSTs to:
+#   https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-run.yml/dispatches
+#   headers: Authorization: Bearer <PAT>, Accept: application/vnd.github+json,
+#            X-GitHub-Api-Version: 2022-11-28 ; body {"ref":"main"}
+#
+# Auth: DEVELOPER_SVC key-pair (matches profiles.yml), role SYSADMIN, into DEV_DB.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'de-pipeline/dbt/**'
+  push:
+    branches: [main]
+    paths:
+      - 'de-pipeline/dbt/**'
+  workflow_dispatch:            # manual button + cron-job.org API dispatch target
+  repository_dispatch:
+    types: [dbt-run]            # alternative external-cron trigger
+
+env:
+  SNOWFLAKE_ACCOUNT:          ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER:             ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
+  SNOWFLAKE_PRIVATE_KEY_PATH: ../.keys/rsa_key.p8   # relative to de-pipeline/dbt
+  SNOWFLAKE_ROLE:             SYSADMIN
+
+jobs:
+  ci:
+    # PRs that touch the dbt project: validate it builds and its tests pass.
+    if: github.event_name == 'pull_request'
+    name: dbt CI (build + test on dev_db)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dbt
+        run: pip install dbt-snowflake==1.7.0
+      - name: Write DEVELOPER_SVC private key
+        env:
+          PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+        run: |
+          mkdir -p de-pipeline/.keys
+          printf '%s' "$PRIVATE_KEY" > de-pipeline/.keys/rsa_key.p8
+      - name: dbt build + test (target dev)
+        working-directory: de-pipeline/dbt
+        run: |
+          dbt deps --profiles-dir .
+          dbt build --target dev --profiles-dir .
+
+  deploy-dev:
+    # Merge to main (dbt change), external cron (cron-job.org), or manual run.
+    if: github.event_name != 'pull_request'
+    name: dbt build -> DEV_DB
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dbt
+        run: pip install dbt-snowflake==1.7.0
+      - name: Write DEVELOPER_SVC private key
+        env:
+          PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+        run: |
+          mkdir -p de-pipeline/.keys
+          printf '%s' "$PRIVATE_KEY" > de-pipeline/.keys/rsa_key.p8
+      - name: dbt build (target dev)
+        working-directory: de-pipeline/dbt
+        run: |
+          dbt deps --profiles-dir .
+          dbt build --target dev --profiles-dir .
