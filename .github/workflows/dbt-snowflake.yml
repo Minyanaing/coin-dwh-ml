@@ -1,0 +1,130 @@
+name: dbt on Snowflake (Step 5a — disabled)
+
+# CI/CD for the Snowflake-native dbt run (Step 5a, snowflake/dbt_project_task.sql):
+#   * PR  -> validate the dbt project (deps + debug + compile) against dev.
+#   * push to main -> CALL SP_RUN_DBT_PROJECT() (via the Snowflake CLI) to fetch
+#                     the latest repo and RE-CREATE the DBT PROJECT. It does not
+#                     build — the scheduled Snowflake Task (TASK_DBT_BUILD) runs
+#                     EXECUTE DBT PROJECT. Split: recreate on merge, run on schedule.
+#
+# DISABLED on purpose. This is ready-to-use reference CI/CD for when the account
+# is upgraded off trial (Step 5a needs an External Access Integration + the
+# dbt-Projects feature, and the CRYPTO_REPO / CRYPTO_PIPELINE objects created by
+# dbt_project_task.sql). Until then, the dev dbt run is dbt-run.yml (Step 5b) —
+# do NOT enable both, or dbt runs from two places.
+#
+# Only `workflow_dispatch` is wired, and the jobs are guarded to pull_request/push,
+# so nothing runs automatically today (a manual dispatch is a no-op). To enable on
+# a billed account: uncomment the pull_request/push triggers below.
+
+on:
+  workflow_dispatch:
+  # pull_request:
+  #   branches: [main]
+  #   paths:
+  #     - 'de-pipeline/dbt/**'
+  #     - '.github/workflows/dbt-snowflake.yml'
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'de-pipeline/dbt/**'
+  #     - '.github/workflows/dbt-snowflake.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate dbt project (compile on dev)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: de-pipeline/dbt
+    env:
+      DBT_PROFILES_DIR: .                       # profiles.yml lives in the project dir
+      SNOWFLAKE_ACCOUNT:          ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER:             ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}    # DEVELOPER_SVC
+      SNOWFLAKE_PRIVATE_KEY_PATH: snowflake_key.p8
+      SNOWFLAKE_ROLE:             SYSADMIN
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dbt
+        run: pip install dbt-snowflake==1.7.0
+
+      - name: Write DEVELOPER_SVC private key
+        env:
+          PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+        run: printf '%s' "$PRIVATE_KEY" > snowflake_key.p8
+
+      - name: Install dbt packages
+        run: dbt deps
+
+      - name: Verify Snowflake connection
+        run: dbt debug --target dev
+
+      - name: Compile (validate models/refs/tests — no materialization)
+        run: dbt compile --target dev --no-partial-parse
+
+      - name: Upload dbt logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-logs-dev
+          path: de-pipeline/dbt/logs/
+
+      - name: Clean up private key
+        if: always()
+        run: rm -f snowflake_key.p8
+
+  deploy:
+    name: Recreate dbt project in Snowflake (sync latest code)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Snowflake CLI
+        run: pip install snowflake-cli
+
+      - name: Write DEVELOPER_SVC private key
+        env:
+          PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+        run: printf '%s' "$PRIVATE_KEY" > snowflake_key.p8
+
+      - name: Recreate the DBT PROJECT from latest main
+        # Fetches the repo and CREATE OR REPLACEs the DBT PROJECT (no build).
+        # The scheduled TASK_DBT_BUILD runs EXECUTE DBT PROJECT on its own.
+        env:
+          SNOWFLAKE_ACCOUNT:   ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER:      ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}       # DEVELOPER_SVC
+          SNOWFLAKE_ROLE:      SYSADMIN
+          SNOWFLAKE_WAREHOUSE: CRYPTO_WH
+          SNOWFLAKE_DATABASE:  CRYPTO_DB
+          SNOWFLAKE_SCHEMA:    STG
+        run: |
+          snow sql \
+            -q "CALL CRYPTO_DB.STG.SP_RUN_DBT_PROJECT();" \
+            --temporary-connection \
+            --account "$SNOWFLAKE_ACCOUNT" \
+            --user "$SNOWFLAKE_USER" \
+            --role "$SNOWFLAKE_ROLE" \
+            --warehouse "$SNOWFLAKE_WAREHOUSE" \
+            --database "$SNOWFLAKE_DATABASE" \
+            --schema "$SNOWFLAKE_SCHEMA" \
+            --authenticator snowflake_jwt \
+            --private-key-path snowflake_key.p8
+
+      - name: Clean up private key
+        if: always()
+        run: rm -f snowflake_key.p8
