@@ -1,13 +1,247 @@
 # Crypto Market Pipeline
 
 Daily crypto market data pipeline: CoinGecko → Snowflake (landing → dev/qa/prod via dbt) → GitHub Actions.
-Full design doc: [`../.claude/crypto-de-pipeline-project-plan.md`](../.claude/crypto-de-pipeline-project-plan.md).
+
+[`Full design doc`](../.claude/crypto-de-pipeline-project-plan.md).
+
+---
+
+## Overview
+
+Data flows **CoinGecko API → `CRYPTO_DB.STG` (Snowflake landing zone) → dbt medallion (Silver → Gold star schema) → `DEV_DB` / `QA_DB` / `PROD_DB`**, all orchestrated by GitHub Actions. Raw data lands once in the shared `CRYPTO_DB.STG`; dbt then builds an independent copy of the warehouse into each environment database by re-running the *same* models with a different `--target`.
+
+The workflows in [`.github/workflows/`](../.github/workflows/):
+
+| Workflow | Does | Triggered by |
+|---|---|---|
+| `infra-ci.yml` | `sqlfluff` parse of `snowflake/**` | PR |
+| `infra-deploy.yml` | apply `setup.sql` / `streams.sql` / `tasks.sql` to Snowflake | merge to `main` + manual |
+| `de-ingest.yml` | ingest CoinGecko snapshot → `CRYPTO_DB.STG` | external cron (cron-job.org) + manual |
+| `de-ingest-history.yml` | one-off historical backfill | manual only |
+| `dbt-run.yml` | build + test dbt into `DEV_DB` | PR + merge + external cron |
+| `dbt-promote.yml` | build `QA_DB` **or** `PROD_DB` (chosen by `target` input) | external cron (one job per env) + manual |
+| `dbt-snowflake.yml` | Snowflake-native dbt (Step 5a) — **disabled**, needs a billed account | — |
+
+Two Snowflake identities: **`DEVELOPER_SVC`** (a `TYPE=SERVICE` key-pair account, `SYSADMIN`+`USERADMIN`) is what every CI workflow authenticates as; **`CRYPTO_PIPELINE_ROLE`** is a narrower data-plane role used only for optional local password auth.
+
+## Data flow — databases, schemas & tables
+
+Raw data lands **once** in the shared `CRYPTO_DB.STG`; dbt then builds the **same** Silver → Gold models into whichever environment database the `--target` points at (`DEV_DB` / `QA_DB` / `PROD_DB`), each an independent copy. Two Python feeds fill the landing zone: the 6-hourly market **snapshot** and a manual daily-**history** backfill.
+
+```mermaid
+flowchart TB
+  API["🌐 CoinGecko API"]
+
+  subgraph LAND["CRYPTO_DB — landing zone (shared by all environments)"]
+    subgraph STG["schema: STG (raw, append-only)"]
+      RAW["COINGECKO_RAW<br/><i>1 row / coin / 6-hourly fetch</i>"]
+      HIST["COINGECKO_HISTORY_RAW<br/><i>1 row / coin / day (backfill)</i>"]
+    end
+  end
+
+  subgraph ENV["DEV_DB / QA_DB / PROD_DB — dbt builds here (same models, picked by --target)"]
+    subgraph SILVER["schema: SILVER_CRYPTO (clean · incremental)"]
+      STGS["stg_coingecko_snapshot<br/><i>coin × fetched_at</i>"]
+      STGH["stg_coingecko_history<br/><i>coin × day</i>"]
+      INT["int_coin_daily<br/><i>coin × day — unified</i>"]
+      SNAP["snap_coin<br/><i>SCD2 snapshot of coin attrs</i>"]
+    end
+    subgraph GOLD["schema: GOLD_CRYPTO (star schema)"]
+      DIMC["dim_coin<br/><i>SCD2 dimension</i>"]
+      DIMD["dim_date<br/><i>generated calendar</i>"]
+      FSNAP["fct_market_snapshot<br/><i>coin × fetched_at</i>"]
+      FDAY["fct_daily_market<br/><i>coin × day</i>"]
+    end
+  end
+
+  API -->|de-ingest.yml| RAW
+  API -->|de-ingest-history.yml • manual| HIST
+
+  RAW --> STGS
+  HIST --> STGH
+  STGS --> INT
+  STGH --> INT
+  STGS --> SNAP
+  STGH --> SNAP
+
+  STGS --> FSNAP
+  INT --> FDAY
+  SNAP --> DIMC
+
+  DIMC -. FK .-> FSNAP
+  DIMD -. FK .-> FSNAP
+  DIMC -. FK .-> FDAY
+  DIMD -. FK .-> FDAY
+```
+
+**Layers at a glance** (`*` = `DEV_DB` / `QA_DB` / `PROD_DB` — identical objects per environment):
+
+| Layer — `database.schema` | Object | Grain (1 row per…) | Built as |
+|---|---|---|---|
+| **Bronze** — `CRYPTO_DB.STG` | `COINGECKO_RAW` | coin × 6-hourly fetch | landing table (append-only) — from `ingest_coingecko.py` |
+| | `COINGECKO_HISTORY_RAW` | coin × day | landing table (append-only) — from `backfill_coingecko_history.py` |
+| **Silver** — `*.SILVER_CRYPTO` | `stg_coingecko_snapshot` | coin × fetched_at | incremental (clean/typed/dedup of `COINGECKO_RAW`) |
+| | `stg_coingecko_history` | coin × day | incremental (clean/typed/dedup of `COINGECKO_HISTORY_RAW`) |
+| | `int_coin_daily` | coin × day | incremental — unifies both feeds; per day keeps **avg across extracts** + **latest extract** + `extract_count` (snapshot wins over history) |
+| | `snap_coin` | coin *version* | dbt snapshot — SCD Type-2 on `symbol`/`name`/`asset_type` |
+| **Gold** — `*.GOLD_CRYPTO` | `dim_coin` | coin *version* | table — SCD2 dimension from `snap_coin` |
+| | `dim_date` | calendar day | table — generated `date_spine` (not from raw) |
+| | `fct_market_snapshot` | coin × fetched_at | incremental fact (intraday detail) |
+| | `fct_daily_market` | coin × day | incremental fact (daily series + day-over-day return) |
+
+### Gold star schema (keys)
+
+Both facts carry surrogate **PK**s and resolve `coin_sk` by an SCD2 **range join** to `dim_coin` (the coin version whose `[valid_from, valid_to)` contains the event) and `date_sk` to `dim_date`.
+
+```mermaid
+erDiagram
+  DIM_COIN ||--o{ FCT_MARKET_SNAPSHOT : "coin_sk"
+  DIM_DATE ||--o{ FCT_MARKET_SNAPSHOT : "date_sk"
+  DIM_COIN ||--o{ FCT_DAILY_MARKET : "coin_sk"
+  DIM_DATE ||--o{ FCT_DAILY_MARKET : "date_sk"
+
+  DIM_COIN {
+    string    coin_sk    PK "surrogate — per version"
+    string    coin_id       "durable natural key"
+    string    symbol
+    string    name
+    string    asset_type    "coin | stablecoin"
+    timestamp valid_from
+    timestamp valid_to
+    boolean   is_current
+  }
+  DIM_DATE {
+    number date_sk    PK "YYYYMMDD"
+    date   date_day
+    number year
+    number quarter
+    number month
+    number day_of_month
+    number iso_day_of_week
+    boolean is_weekend
+  }
+  FCT_MARKET_SNAPSHOT {
+    string    snapshot_sk PK
+    string    coin_sk     FK
+    number    date_sk     FK
+    timestamp fetched_at
+    number    price_usd
+    number    market_cap_usd
+    number    volume_24h_usd
+    number    high_24h
+    number    low_24h
+    number    all_time_high
+  }
+  FCT_DAILY_MARKET {
+    string daily_market_sk PK
+    string coin_sk         FK
+    number date_sk         FK
+    date   price_date
+    number extract_count
+    number avg_price_usd
+    number latest_price_usd
+    number prev_latest_price_usd
+    number daily_return_pct
+  }
+```
+
+## How the deployment flow runs (after setup)
+
+Once the one-time setup below is done, the pipeline runs itself. Work reaches Snowflake three ways:
+
+**A. Scheduled (production) — external cron via cron-job.org.** GitHub's built-in `schedule:` is delayed/dropped under load and only fires from the default branch, so instead cron-job.org POSTs to each workflow's REST dispatch endpoint on time (set directly in Bangkok time). The daily flow is staggered so each stage's inputs have landed:
+
+```
+08:00  de-ingest.yml    →  CoinGecko snapshot → CRYPTO_DB.STG.COINGECKO_RAW   (repeats every 6h)
+08:30  dbt-run.yml      →  dbt build --target dev   → DEV_DB    (Silver + Gold + tests)
+09:00  dbt-promote.yml  →  dbt build --target qa    → QA_DB     (gated by "qa" reviewers, if set)
+10:00  dbt-promote.yml  →  dbt build --target prod  → PROD_DB   (gated by "prod" reviewers, if set)
+```
+
+The stages are independent workflows (no hard `needs:` across them) — the stagger is a loose coupling, not a dependency. Because Silver/Gold are incremental, a late or missed upstream run just means that cycle merges fewer new rows rather than breaking.
+
+**B. On code change — GitHub-native CI/CD (PR + merge to `main`).**
+
+| You do | GitHub runs |
+|---|---|
+| Open a PR touching `de-pipeline/snowflake/**` | `infra-ci.yml` — `sqlfluff` parse (no credentials) |
+| Merge to `main` touching `de-pipeline/snowflake/**` | `infra-deploy.yml` — apply the SQL to Snowflake |
+| Open a PR touching `de-pipeline/dbt/**` | `dbt-run.yml` **ci** — `dbt build` + tests on `DEV_DB` |
+| Merge to `main` touching `de-pipeline/dbt/**` | `dbt-run.yml` **deploy-dev** — rebuild `DEV_DB` |
+
+**C. Manual — any time.** Every workflow has a **Run workflow** button (**GitHub repo → Actions → _workflow_ → Run workflow**); for `dbt-promote.yml` pick the `qa` or `prod` target from the dropdown. Ingestion and dbt also run locally (sections 2–3).
+
+> **Promotion gates:** QA/PROD builds pause for a manual **Approve** click only if you add Required Reviewers to the `qa` / `prod` GitHub Environments (section 4.2). With no reviewers, they run straight through.
+
+## Quickstart — stand up a new Snowflake account (~10 minutes)
+
+Do these in order. **Steps 1–4 stand the platform up** (~5 min, copy-paste); **steps 5–6 turn on automation.** Each step is expanded in the numbered sections further down.
+
+**Prerequisites:** `openssl` (ships with Git for Windows), **Python 3.11+**, this repo pushed to your own GitHub `main`, a Snowflake account you can log into as **`ACCOUNTADMIN`**, and a free [cron-job.org](https://cron-job.org) account (for scheduling in step 6).
+
+### Step 1 — Generate the service-account key pair · _detail: §1.1_
+
+From the `de-pipeline/` folder:
+
+```bash
+mkdir -p .keys && cd .keys
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt   # private key (never commit)
+openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub                               # public key (goes to Snowflake)
+```
+
+### Step 2 — Bootstrap Snowflake (once, as `ACCOUNTADMIN`) · _detail: §1.2_
+
+Paste into a Snowsight worksheet. Put the **body** of `rsa_key.pub` (drop the `BEGIN/END` lines and newlines) into `RSA_PUBLIC_KEY`. This is the **only** thing you run by hand in Snowflake — `infra-deploy.yml` (step 4) builds everything else.
+
+```sql
+USE ROLE ACCOUNTADMIN;
+
+CREATE USER IF NOT EXISTS DEVELOPER_SVC
+  TYPE = SERVICE
+  RSA_PUBLIC_KEY = '<paste rsa_key.pub body here>'
+  DEFAULT_ROLE = SYSADMIN
+  DEFAULT_WAREHOUSE = CRYPTO_WH
+  COMMENT = 'Infra CI/CD service account (key-pair auth)';
+
+GRANT ROLE SYSADMIN  TO USER DEVELOPER_SVC;   -- build warehouses / databases / schemas / tables
+GRANT ROLE USERADMIN TO USER DEVELOPER_SVC;   -- create CRYPTO_PIPELINE_ROLE
+GRANT EXECUTE TASK  ON ACCOUNT TO ROLE SYSADMIN;   -- else ALTER TASK ... RESUME fails
+GRANT MANAGE GRANTS ON ACCOUNT TO ROLE SYSADMIN;   -- else GRANT ... ON FUTURE ... fails
+```
+
+### Step 3 — Add three GitHub Actions secrets · _detail: §1.3_
+
+**Repo → Settings → Secrets and variables → Actions → New repository secret:**
+
+| Secret | Value |
+|---|---|
+| `SNOWFLAKE_ACCOUNT` | your account identifier, e.g. `xy12345.us-east-1` |
+| `SNOWFLAKE_DEV_SVC_USER` | `DEVELOPER_SVC` |
+| `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` | the full contents of `.keys/rsa_key.p8` (**including** the `-----BEGIN/END PRIVATE KEY-----` lines) |
+
+### Step 4 — Deploy the Snowflake infra · _detail: §1.4_
+
+**Repo → Actions → _Infra Deploy_ → Run workflow** (branch `main`). This applies `setup.sql` / `streams.sql` / `tasks.sql`, creating `CRYPTO_WH`, the four databases (`CRYPTO_DB`, `DEV_DB`, `QA_DB`, `PROD_DB`) with their schemas, the landing tables, the stream/task, and `CRYPTO_PIPELINE_ROLE`.
+
+> ✅ **Platform is ready.** The account can now hold data and dbt can build. Everything below is verification and automation.
+
+### Step 5 — (Recommended) smoke-test locally · _detail: §2 + §3_
+
+Before automating, prove the path end-to-end from your machine: load one ingestion into Snowflake (**§2.1 → §2.3**), then run a dbt build (**§3.1 → §3.4**). You should see rows in `CRYPTO_DB.STG.COINGECKO_RAW` and models in `DEV_DB.SILVER_CRYPTO` / `DEV_DB.GOLD_CRYPTO`.
+
+### Step 6 — Turn on automation (scheduling) · _detail: §4.2, then §2.4 / §3.6 / §4.3_
+
+1. Create GitHub **Environments** `qa` and `prod` — add **Required Reviewers** on any you want to gate for manual approval (**§4.2**).
+2. Create one fine-grained GitHub **PAT** (**Actions: Read and write**) for the scheduler (**§3.6 step 1**).
+3. Create the **cron-job.org** jobs, staggered: ingestion (**§2.4**) → dev build (**§3.6**) → qa & prod promotion (**§4.3**).
+
+**Done — the pipeline now runs itself.** See [How the deployment flow runs](#how-the-deployment-flow-runs-after-setup) above for exactly what fires when.
 
 ---
 
 ## 1. Create a developer service account (key-pair auth)
 
-This account is for **infra setup** — applying `snowflake/setup.sql`, `streams.sql`, and `tasks.sql`, done automatically by `infra-deploy.yml` (section 1.3–1.4) rather than run by hand — not for the ingestion pipeline itself (that uses `CRYPTO_PIPELINE_ROLE`, created *by* this account, and runs on its own GitHub Actions schedule — see the project plan's Step 5). Key-pair authentication is used instead of a password so nothing secret ever needs to be typed into a SQL client or stored as a plaintext password.
+This account is for **infra setup** — applying `snowflake/setup.sql`, `streams.sql`, and `tasks.sql`, done automatically by `infra-deploy.yml` (section 1.3–1.4) rather than run by hand — not for the ingestion pipeline itself (which runs on its own external-cron schedule — see section 2.4). Key-pair authentication is used instead of a password so nothing secret ever needs to be typed into a SQL client or stored as a plaintext password.
 
 `snowflake/ingest_task.sql` also exists in the repo but is currently **disabled** (section 1.5) — it's not applied by `infra-deploy.yml`.
 
@@ -45,6 +279,8 @@ openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
 Run once as `ACCOUNTADMIN` (Snowsight worksheet or any SQL client). Paste the contents of `rsa_key.pub` with the `-----BEGIN/END PUBLIC KEY-----` header/footer and newlines stripped out:
 
 ```sql
+USE ROLE ACCOUNTADMIN;
+
 CREATE USER IF NOT EXISTS DEVELOPER_SVC
   TYPE = SERVICE
   RSA_PUBLIC_KEY = '<contents of rsa_key.pub>'
