@@ -1,11 +1,22 @@
-# Development targets DEV_DB only. QA / PROD promotion targets are added in a
-# later deployment step — during development, all dbt runs land in dev_db.
+# Three targets — dev / qa / prod — selected with `dbt build --target <env>`.
+# Promotion is just re-running the SAME models against the next database:
+#   dev -> DEV_DB, qa -> QA_DB, prod -> PROD_DB, all reading the one shared
+#   landing zone CRYPTO_DB.STG. Only `database` differs per target; the
+#   connection (account / user / private key / role) is read from environment
+#   variables and is identical across all three, so profiles.yml is the only
+#   per-environment knob and nothing env-specific is hardcoded except the DB.
 #
 # Auth: key-pair as the DEVELOPER_SVC service account (the same account + key
 # used for the Snowflake infra setup). DEVELOPER_SVC is TYPE=SERVICE, so it has
-# no password — only key-pair. Its usable role is SYSADMIN, which owns DEV_DB
-# and CRYPTO_DB.STG, so it can read the landing tables and build
-# silver_crypto / gold_crypto.
+# no password — only key-pair. Its usable role is SYSADMIN, which owns DEV_DB /
+# QA_DB / PROD_DB and CRYPTO_DB.STG, so it can read the landing tables and build
+# silver_crypto / gold_crypto in every environment.
+#
+# Env vars (same names for every target — set them once per shell / CI job):
+#   SNOWFLAKE_ACCOUNT           (required)  account identifier
+#   SNOWFLAKE_USER             (required)  DEVELOPER_SVC
+#   SNOWFLAKE_PRIVATE_KEY_PATH (optional)  defaults to ../.keys/rsa_key.p8
+#   SNOWFLAKE_ROLE             (optional)  defaults to SYSADMIN
 crypto_pipeline:
   target: dev
   outputs:
@@ -18,5 +29,29 @@ crypto_pipeline:
       role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
       warehouse: CRYPTO_WH
       database: DEV_DB
+      schema: PUBLIC          # overridden per-layer by generate_schema_name (silver_crypto / gold_crypto)
+      threads: 4
+
+    qa:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"                                        # DEVELOPER_SVC
+      authenticator: snowflake_jwt
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH', '../.keys/rsa_key.p8') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
+      warehouse: CRYPTO_WH
+      database: QA_DB
+      schema: PUBLIC          # overridden per-layer by generate_schema_name (silver_crypto / gold_crypto)
+      threads: 4
+
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"                                        # DEVELOPER_SVC
+      authenticator: snowflake_jwt
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH', '../.keys/rsa_key.p8') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
+      warehouse: CRYPTO_WH
+      database: PROD_DB
       schema: PUBLIC          # overridden per-layer by generate_schema_name (silver_crypto / gold_crypto)
       threads: 4

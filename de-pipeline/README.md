@@ -80,7 +80,7 @@ Snowflake splits these privileges across two built-in roles — `SYSADMIN` canno
 | `SNOWFLAKE_DEV_SVC_USER` | `DEVELOPER_SVC` |
 | `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` | the full contents of `.keys/rsa_key.p8`, including the `-----BEGIN/END PRIVATE KEY-----` lines |
 
-`SNOWFLAKE_ACCOUNT` is shared with `de-deploy.yml` (Step 5) and only needs to be added once.
+`SNOWFLAKE_ACCOUNT` is shared with the dbt workflows (`dbt-run.yml` / `dbt-promote.yml`, Steps 5b/6) and only needs to be added once.
 
 ### 1.4 Apply the infra
 
@@ -366,3 +366,58 @@ Notes:
 - GitHub returns **`204 No Content`** on success (empty body); treat any `2xx` as OK in cron-job.org. A `401`/`403` means the PAT is wrong or missing the Actions permission; `404` usually means a wrong `<owner>`/repo/workflow filename or a token without access.
 - cron-job.org sends a `User-Agent` automatically (GitHub requires one); if you ever get a `403` about a missing User-Agent, add `User-Agent: cron-job.org` to the headers.
 - The workflow authenticates to Snowflake with the same `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` repo secrets used elsewhere — those must be set (project plan Step 6) for the dispatched run to succeed.
+
+---
+
+## 4. Promote to QA and PROD (`dbt-promote.yml`)
+
+Section 3 builds **dev** (`DEV_DB`). Promotion re-runs the *same* models against `QA_DB` or `PROD_DB` — there's no data copy, just a different dbt `--target`. `dbt-promote.yml` is **one parameterized workflow**: it takes a `target` input (`qa` or `prod`) and builds that one database, so QA and PROD share identical credentials and differ only by which target you dispatch. `dbt/profiles.yml` has three targets sharing one connection (the `DEVELOPER_SVC` key-pair); only the database differs:
+
+| Target | Database | Selected by |
+|---|---|---|
+| `dev` (default) | `DEV_DB` | `dbt build --target dev` |
+| `qa` | `QA_DB` | `dbt build --target qa` |
+| `prod` | `PROD_DB` | `dbt build --target prod` |
+
+All three read the same env vars from section 3.2 (`SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER=DEVELOPER_SVC`, `SNOWFLAKE_PRIVATE_KEY_PATH`, `SNOWFLAKE_ROLE`) — nothing extra to set. `SYSADMIN` owns all four databases, so the same key works everywhere.
+
+### 4.1 Run a promotion locally (optional)
+
+From `de-pipeline/dbt/`, same as dev — just change `--target`:
+
+```bash
+dbt build --target qa   --profiles-dir .    # build QA_DB
+dbt build --target prod --profiles-dir .    # build PROD_DB
+```
+
+Each target builds a complete, independent copy of `silver_crypto` + `gold_crypto` in its database from the shared `CRYPTO_DB.STG` landing tables.
+
+### 4.2 Create the `qa` and `prod` GitHub Environments (approval gates)
+
+The promotion job sets its [GitHub Environment](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment) to whichever `target` it's building, so the matching environment's protection rules gate that run. Go to **GitHub repo → Settings → Environments** and create **`qa`** and **`prod`** (you likely already have `infra` from section 1). On each, add yourself/your team under **Required reviewers** so a promotion pauses for a manual **Approve** click:
+
+- a run with `target=qa` runs in the `qa` environment (build `QA_DB`).
+- a run with `target=prod` runs in the `prod` environment (build `PROD_DB`).
+
+With no reviewers configured, the run proceeds straight through with no pause. No new secrets are needed — `dbt-promote.yml` reuses the `DEVELOPER_SVC` key-pair secrets from section 1.3.
+
+### 4.3 Schedule each environment with its own cron-job.org job
+
+`dbt-promote.yml` builds **one** target per run, chosen by a `target` input, so QA and PROD get **separate** cron-job.org jobs — each on its own schedule and each sending a different `target`. Same mechanism, PAT, and headers as section 3.6; just add the input to the request body. Schedule both **after** the dev build so the day's rows have landed.
+
+Create two cron-job.org jobs, identical except for **Schedule** and **Request body**:
+
+| Field | Value |
+|---|---|
+| URL | `https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-promote.yml/dispatches` |
+| Request method | **POST** |
+| Headers | `Accept: application/vnd.github+json`  ·  `Authorization: Bearer <PAT>`  ·  `X-GitHub-Api-Version: 2022-11-28`  ·  `Content-Type: application/json` |
+
+| Cron job | Schedule (Asia/Bangkok) | Request body |
+|---|---|---|
+| `dbt promote (qa)` | e.g. **09:00** | `{"ref":"main","inputs":{"target":"qa"}}` |
+| `dbt promote (prod)` | e.g. **10:00** | `{"ref":"main","inputs":{"target":"prod"}}` |
+
+The `inputs` object is what selects the target — it works because the workflow declares a `workflow_dispatch` input named `target` and the file is on the default branch (`main`). Reuse the **same PAT** from section 3.6 (fine-grained, **Actions: Read and write**); the `204`/`401`/`403`/`404` and `User-Agent` notes there apply here too. When a job fires, the run starts and then **waits on that environment's reviewer approval** (if configured) before building.
+
+> You can also promote by hand any time: **Actions → dbt promote (qa / prod) → Run workflow → pick `qa` or `prod`**.
