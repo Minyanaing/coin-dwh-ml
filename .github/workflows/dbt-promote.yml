@@ -1,0 +1,91 @@
+name: dbt promote (qa / prod)
+
+# Step 6 — promotes the dbt project to QA or PROD by re-running the SAME models
+# against a different database. Promotion is not a data copy — each target
+# rebuilds a full, independent medallion + star schema from the shared landing
+# zone CRYPTO_DB.STG. Dev is built continuously by dbt-run.yml (Step 5b).
+#
+# ONE parameterized workflow, not a qa->prod chain. Every target shares the
+# exact same credentials/secrets — the ONLY thing that changes per environment
+# is the `target` input, which picks the database via profiles.yml
+# (qa -> QA_DB, prod -> PROD_DB). So there are no per-env secrets or env vars.
+#
+# Set up a SEPARATE cron-job.org schedule per environment, each POSTing a
+# different `target` input (each env can have its own time):
+#   qa   : body {"ref":"main","inputs":{"target":"qa"}}
+#   prod : body {"ref":"main","inputs":{"target":"prod"}}
+# POST to (no GitHub `schedule:` — unreliable, only fires from default branch):
+#   https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-promote.yml/dispatches
+#   headers: Authorization: Bearer <PAT>, Accept: application/vnd.github+json,
+#            X-GitHub-Api-Version: 2022-11-28
+#
+# Gating: the job's GitHub Environment is set to the chosen target, so per-env
+# required reviewers (Settings -> Environments -> qa / prod) still gate the run;
+# with no reviewers it proceeds straight through.
+#
+# Auth: DEVELOPER_SVC key-pair (matches profiles.yml), role SYSADMIN, which owns
+# QA_DB and PROD_DB and can read the shared CRYPTO_DB.STG landing tables.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'dbt target to build (which environment database)'
+        type: choice
+        options:
+          - qa
+          - prod
+        default: qa
+  repository_dispatch:
+    types: [dbt-promote]        # external cron; send client_payload {"target":"qa|prod"}
+
+permissions:
+  contents: read
+
+env:
+  SNOWFLAKE_ACCOUNT:          ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER:             ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}   # DEVELOPER_SVC
+  SNOWFLAKE_PRIVATE_KEY_PATH: ../.keys/rsa_key.p8   # relative to de-pipeline/dbt
+  SNOWFLAKE_ROLE:             SYSADMIN
+
+jobs:
+  promote:
+    # One job, parameterized by the `target` input (workflow_dispatch) or
+    # client_payload.target (repository_dispatch). The GitHub Environment is set
+    # to the same name so per-env reviewers gate it; the credentials above are
+    # identical for every target.
+    name: dbt build -> ${{ github.event.inputs.target || github.event.client_payload.target }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target || github.event.client_payload.target }}
+    env:
+      DBT_TARGET: ${{ github.event.inputs.target || github.event.client_payload.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dbt
+        run: pip install dbt-snowflake==1.7.0
+
+      - name: Validate target
+        # Guard against an empty/invalid target (e.g. a repository_dispatch with
+        # no client_payload.target). profiles.yml only defines qa and prod here.
+        run: |
+          if [ "$DBT_TARGET" != "qa" ] && [ "$DBT_TARGET" != "prod" ]; then
+            echo "::error::target must be 'qa' or 'prod' (got '$DBT_TARGET'). For repository_dispatch, send client_payload {\"target\":\"qa|prod\"}."
+            exit 1
+          fi
+
+      - name: Write DEVELOPER_SVC private key
+        env:
+          PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+        run: |
+          mkdir -p de-pipeline/.keys
+          printf '%s' "$PRIVATE_KEY" > de-pipeline/.keys/rsa_key.p8
+
+      - name: dbt build (target ${{ env.DBT_TARGET }})
+        working-directory: de-pipeline/dbt
+        run: |
+          dbt deps --profiles-dir .
+          dbt build --target "$DBT_TARGET" --profiles-dir .
