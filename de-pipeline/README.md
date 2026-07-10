@@ -138,7 +138,7 @@ snowsql -a <account_identifier> -u DEVELOPER_SVC \
 
 `snowflake/ingest_task.sql` is a from-inside-Snowflake alternative to the standalone `de-ingest.yml` GitHub Actions workflow (the project plan's Step 3a). It's **not in use** and **not applied** by `infra-deploy.yml` — skip this section unless you've upgraded off a Snowflake trial account.
 
-It would call the CoinGecko API from *inside* Snowflake, which needs an **External Access Integration** — an account-level object requiring the global `CREATE INTEGRATION` privilege. That privilege isn't available on a Snowflake trial account, so `ingest_task.sql`'s SQL is fully commented out in the repo rather than deleted. Production ingestion runs the GitHub Actions way instead (`ingest_coingecko.py` via `de-ingest.yml`, scheduled daily — see section 2 below).
+It would call the CoinGecko API from *inside* Snowflake, which needs an **External Access Integration** — an account-level object requiring the global `CREATE INTEGRATION` privilege. That privilege isn't available on a Snowflake trial account, so `ingest_task.sql`'s SQL is fully commented out in the repo rather than deleted. Production ingestion runs the GitHub Actions way instead (`ingest_coingecko.py` via `de-ingest.yml`, on an external-cron schedule — see section 2 below).
 
 If you later upgrade the Snowflake account and want to switch to Task-based ingestion, `ingest_task.sql`'s header comment has the exact steps: run the `ACCOUNTADMIN` network-rule/integration setup once, uncomment the file's contents, and add it back to `run_sql.py`'s file list in `infra-deploy.yml`. Decide at that point whether to keep the `de-ingest.yml` workflow running too — running both would double-insert rows.
 
@@ -180,7 +180,7 @@ Output: `ingestion/data/coingecko_raw_<timestamp>.csv` — open it and confirm t
 
 ### 2.3 Switch to loading into Snowflake
 
-This is the same mode `de-ingest.yml` runs in production, on a schedule — see the project plan's Step 3a for the actual GitHub Actions workflow (daily at 8AM Bangkok time / 1AM UTC). Running it here by hand first is how you verify the write path before trusting the scheduled job.
+This is the same mode `de-ingest.yml` runs in production, on an external-cron schedule (cron-job.org — see §2.4). Running it here by hand first is how you verify the write path before trusting the scheduled job.
 
 Copy `ingestion/.env.example` to `ingestion/.env` (gitignored — never commit it) and fill in:
 
@@ -202,6 +202,29 @@ python ingestion/ingest_coingecko.py
 ```
 
 See [`ingest_coingecko.py`](ingestion/ingest_coingecko.py) and [`config.py`](ingestion/config.py) for the full local/Snowflake mode switch, and the [project plan](../.claude/crypto-de-pipeline-project-plan.md) for the dbt/CI/CD steps that follow ingestion.
+
+### 2.4 Schedule ingestion in production (cron-job.org)
+
+In production the ingestion runs on GitHub Actions (`.github/workflows/de-ingest.yml`) — the same `INGEST_MODE=snowflake` run as section 2.3, authenticating as the `DEVELOPER_SVC` key-pair. It has **no GitHub `schedule:` trigger** (GitHub's built-in cron is delayed/dropped under load and only fires from the default branch), so an external scheduler — **cron-job.org** — fires it by calling the GitHub REST API (`workflow_dispatch`). Same mechanism as the dbt workflows in §3.6 / §4.3.
+
+**1. Reuse (or create) the GitHub PAT.** The same fine-grained token used in §3.6 works here — **Repository access:** `coin-dwh-ml`, **Permissions → Actions: Read and write**. It lives only in cron-job.org, never in the repo. (If you haven't made one yet, see §3.6 step 1.)
+
+**2. Create the cron-job.org job** (Console → **Create cronjob**):
+
+| Field | Value |
+|---|---|
+| Title | `de-ingest (snapshot)` |
+| URL | `https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/de-ingest.yml/dispatches` |
+| Schedule | your load cadence in **Asia/Bangkok** — e.g. every 6 hours at **08:00 / 14:00 / 20:00 / 02:00** (cron-job.org has a timezone selector — no UTC math) |
+| Request method | **POST** |
+| Request body | `{"ref":"main"}` |
+| Headers | `Accept: application/vnd.github+json`  ·  `Authorization: Bearer <PAT>`  ·  `X-GitHub-Api-Version: 2022-11-28`  ·  `Content-Type: application/json` |
+
+Notes:
+- **`ref` must be the default branch** (`main`) and `de-ingest.yml` must exist on it — `workflow_dispatch` only dispatches from the default branch.
+- GitHub returns **`204 No Content`** on success; the `204`/`401`/`403`/`404` and `User-Agent` notes from §3.6 apply here too.
+- The run needs the `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` repo secrets from §1.3 to reach Snowflake.
+- Stagger the dbt schedules (§3.6 / §4.3) **after** the ingestion slot so each day's rows have landed before dbt builds on top.
 
 ---
 
