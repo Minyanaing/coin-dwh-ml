@@ -1,0 +1,75 @@
+version: 2
+
+models:
+  - name: dim_coin
+    description: "SCD Type-2 coin dimension — one row per coin version."
+    columns:
+      - name: coin_sk
+        description: "Surrogate primary key (unique per version)."
+        tests: [not_null, unique]
+      - name: coin_id
+        description: "Durable natural key (CoinGecko id) — NOT unique under SCD2."
+        tests: [not_null]
+      - name: asset_type
+        tests:
+          - accepted_values:
+              values: ['coin', 'stablecoin']
+      - name: is_current
+        tests: [not_null]
+    tests:
+      # exactly one current version per coin
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [coin_id, is_current]
+          config:
+            where: "is_current = true"
+
+  - name: dim_date
+    description: "Calendar date dimension."
+    columns:
+      - name: date_sk
+        description: "Surrogate primary key (YYYYMMDD)."
+        tests: [not_null, unique]
+      - name: date_day
+        tests: [not_null, unique]
+
+  - name: fct_market_snapshot
+    description: "Fact — one row per coin per 6-hourly snapshot."
+    columns:
+      - name: snapshot_sk
+        description: "Surrogate primary key."
+        tests: [not_null, unique]
+      - name: coin_sk
+        description: "FK to dim_coin."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_coin')
+              field: coin_sk
+      - name: date_sk
+        description: "FK to dim_date."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_sk
+
+  - name: fct_daily_market
+    description: "Fact — one row per coin per day."
+    columns:
+      - name: daily_market_sk
+        description: "Surrogate primary key."
+        tests: [not_null, unique]
+      - name: coin_sk
+        description: "FK to dim_coin."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_coin')
+              field: coin_sk
+      - name: date_sk
+        description: "FK to dim_date."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_sk

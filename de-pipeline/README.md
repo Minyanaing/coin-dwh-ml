@@ -176,7 +176,7 @@ python ingestion\ingest_coingecko.py
 python ingestion/ingest_coingecko.py
 ```
 
-Output: `ingestion/data/coingecko_raw_<timestamp>.csv` — open it and confirm the 50 rows of CoinGecko data look right.
+Output: `ingestion/data/coingecko_raw_<timestamp>.csv` — open it and confirm the rows (one per coin in the curated set) look right.
 
 ### 2.3 Switch to loading into Snowflake
 
@@ -202,3 +202,130 @@ python ingestion/ingest_coingecko.py
 ```
 
 See [`ingest_coingecko.py`](ingestion/ingest_coingecko.py) and [`config.py`](ingestion/config.py) for the full local/Snowflake mode switch, and the [project plan](../.claude/crypto-de-pipeline-project-plan.md) for the dbt/CI/CD steps that follow ingestion.
+
+---
+
+## 3. Local dbt setup & running (dev_db)
+
+The dbt project lives in [`dbt/`](dbt/) and builds the medallion → star schema (Silver `silver_crypto`, Gold `gold_crypto`) into **`DEV_DB`** — the only target during development. `dbt/profiles.yml` is committed and reads all credentials from **environment variables**, so no secrets are stored in the repo.
+
+**Prerequisites:**
+
+1. `snowflake/setup.sql` has been applied, so `DEV_DB.SILVER_CRYPTO` / `DEV_DB.GOLD_CRYPTO` already exist. dbt **uses** those schemas — it does not create them.
+2. You have the `DEVELOPER_SVC` private key locally (`.keys/rsa_key.p8` from section 1.1) — dbt authenticates with it.
+3. There is raw data in `CRYPTO_DB.STG` to transform — run the ingestion in Snowflake mode first (section 2.3), otherwise Silver/Gold build empty.
+
+### 3.1 Install dbt
+
+Reuse the same `de-pipeline/.venv` from section 2.1 (or make a fresh one), then add the Snowflake adapter:
+
+```cmd
+:: Windows cmd
+cd de-pipeline
+.venv\Scripts\activate.bat
+pip install dbt-snowflake==1.7.0
+```
+
+```bash
+# Linux / macOS
+cd de-pipeline
+source .venv/bin/activate
+pip install dbt-snowflake==1.7.0
+```
+
+### 3.2 Set the connection environment variables
+
+`dbt/profiles.yml` authenticates as **`DEVELOPER_SVC` via key-pair** (the same account and key from section 1) and resolves the connection from these variables via `env_var()`:
+
+| Env var | Required | Purpose |
+|---|---|---|
+| `SNOWFLAKE_ACCOUNT` | yes | Account identifier, e.g. `xy12345.us-east-1` |
+| `SNOWFLAKE_USER` | yes | `DEVELOPER_SVC` |
+| `SNOWFLAKE_PRIVATE_KEY_PATH` | no (default `../.keys/rsa_key.p8`) | Path to the private key `.p8` from section 1.1 |
+| `SNOWFLAKE_ROLE` | no (default `SYSADMIN`) | Role dbt builds as |
+
+> `DEVELOPER_SVC` is `TYPE = SERVICE` — key-pair only, no password — so there's **no** `SNOWFLAKE_PASSWORD` here. Its usable role is `SYSADMIN`, which owns `DEV_DB` and `CRYPTO_DB.STG`, so it can read the landing tables and build the Silver/Gold schemas. (A dedicated least-privilege key-pair user with `CRYPTO_PIPELINE_ROLE` is the tidier long-term option, but reusing `DEVELOPER_SVC` keeps one credential for dev.)
+> The default key path is relative to `de-pipeline/dbt/`, so it resolves when you run dbt from there (section 3.3). Set an absolute `SNOWFLAKE_PRIVATE_KEY_PATH` if you run from elsewhere. Warehouse (`CRYPTO_WH`) and database (`DEV_DB`) are pinned in `profiles.yml`.
+
+```cmd
+:: Windows cmd — session-scoped; re-run in each new shell
+set SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+set SNOWFLAKE_USER=DEVELOPER_SVC
+:: optional — defaults shown
+set SNOWFLAKE_PRIVATE_KEY_PATH=..\.keys\rsa_key.p8
+set SNOWFLAKE_ROLE=SYSADMIN
+```
+
+```bash
+# Linux / macOS — session-scoped; add to ~/.bashrc / ~/.zshrc to persist
+export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+export SNOWFLAKE_USER=DEVELOPER_SVC
+# optional — defaults shown
+export SNOWFLAKE_PRIVATE_KEY_PATH=../.keys/rsa_key.p8
+export SNOWFLAKE_ROLE=SYSADMIN
+```
+
+> If your key is encrypted (a passphrase-protected `.p8`), also add a `private_key_passphrase` line to `profiles.yml`. The section-1.1 key is generated unencrypted (`-nocrypt`), so none is needed here.
+> dbt reads OS environment variables directly — it does **not** load `ingestion/.env` (that file is only for the Python ingestion via `python-dotenv`).
+
+### 3.3 Verify the connection
+
+`profiles.yml` sits inside the project dir (not `~/.dbt`), so pass `--profiles-dir .` and run from `de-pipeline/dbt/`:
+
+```cmd
+cd dbt
+dbt deps --profiles-dir .            :: install dbt_utils (first time only)
+dbt debug --profiles-dir .           :: checks creds + DEV_DB reachability
+```
+
+```bash
+cd dbt
+dbt deps --profiles-dir .            # install dbt_utils (first time only)
+dbt debug --profiles-dir .           # checks creds + DEV_DB reachability
+```
+
+### 3.4 Build & test
+
+`dbt build` runs the models, the SCD2 snapshot, and all tests together (a failing PK/FK/type test fails the build):
+
+```bash
+dbt build --target dev --profiles-dir .
+```
+
+Handy subsets while developing (all from `de-pipeline/dbt/`, all take `--profiles-dir .`):
+
+| Command | What it does |
+|---|---|
+| `dbt run --select silver` | build only the Silver staging models |
+| `dbt run --select gold` | build only the Gold dims + facts |
+| `dbt build --select stg_coingecko_snapshot+` | a model **and** everything downstream of it |
+| `dbt snapshot` | refresh the SCD Type-2 `snap_coin` snapshot on its own |
+| `dbt test` | run the PK / FK / uniqueness / range tests only |
+| `dbt docs generate` then `dbt docs serve` | browse the lineage graph + docs locally |
+
+Everything targets `DEV_DB` only. Promotion to `QA_DB` / `PROD_DB` is a later step and isn't part of local development.
+
+### 3.5 Full refresh — reload the whole pipeline (truncate & load)
+
+Normal runs are **incremental** — each model processes only new rows. When you need to rebuild everything from source (schema change, backfilled/corrected raw data, or just a clean slate), pass `--full-refresh`. dbt then **drops and recreates** each incremental table and reloads it in full from the landing tables — the truncate-and-load of the whole pipeline:
+
+```cmd
+:: Windows cmd — from de-pipeline/dbt
+dbt build --full-refresh --target dev --profiles-dir .
+```
+
+```bash
+# Linux / macOS — from de-pipeline/dbt
+dbt build --full-refresh --target dev --profiles-dir .
+```
+
+This fully reloads the incremental models (`stg_coingecko_snapshot`, `stg_coingecko_history`, `int_coin_daily`, `fct_market_snapshot`, `fct_daily_market`); the plain tables (`dim_coin`, `dim_date`) are rebuilt every run anyway. Scope it to part of the DAG the same way as a normal build, e.g. `dbt build --full-refresh --select silver+`.
+
+**Snapshots are the exception.** `--full-refresh` does **not** rebuild the SCD Type-2 `snap_coin` snapshot — its history is meant to persist across runs. If you want a *true* from-scratch reset that also wipes SCD2 history, drop the snapshot first (a `reset_snapshots` operation macro is included), then full-refresh:
+
+```bash
+dbt run-operation reset_snapshots --target dev --profiles-dir .   # drops snap_coin — discards SCD2 history
+dbt build --full-refresh --target dev --profiles-dir .            # rebuilds everything, snapshot re-initializes
+```
+
+> Skip `reset_snapshots` unless you specifically want to lose the accumulated coin-attribute history — a normal `--full-refresh` already reloads all the actual data.

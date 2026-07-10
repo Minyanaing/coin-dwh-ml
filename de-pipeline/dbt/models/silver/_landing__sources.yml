@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: landing
+    description: >
+      Raw CoinGecko landing zone (Bronze). Append-only tables populated by the
+      ingestion scripts. Always in CRYPTO_DB.STG, regardless of the dbt target.
+    database: CRYPTO_DB
+    schema: STG
+    tables:
+      - name: coingecko_raw
+        description: "6-hourly market snapshot (loaded by de-ingest.yml / ingest_coingecko.py)."
+      - name: coingecko_history_raw
+        description: "Daily historical series (loaded on demand by backfill_coingecko_history.py)."

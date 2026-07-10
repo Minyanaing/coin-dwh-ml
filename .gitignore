@@ -17,6 +17,9 @@ de-pipeline/.keys/
 de-pipeline/dbt/target/
 de-pipeline/dbt/dbt_packages/
 de-pipeline/dbt/logs/
+de-pipeline/dbt/.user.yml
 
 # github action
 # .github/
+
+.claude/
