@@ -1,14 +1,22 @@
 name: DE Ingest
 
-# Standalone data-ingestion workflow — deliberately separate from de-deploy.yml
-# (dbt promotion) so ingestion and transformation run on independent schedules
-# and can be triggered, retried, and reasoned about in isolation.
+# Standalone data-ingestion workflow — deliberately separate from the dbt
+# workflows (dbt-run.yml / dbt-promote.yml) so ingestion and transformation run
+# on independent schedules and can be triggered, retried, and reasoned about in
+# isolation.
+#
+# Triggered by external cron (cron-job.org), NOT GitHub's built-in `schedule:`
+# (delayed/dropped under load, and only fires from the default branch).
+# cron-job.org POSTs to the GitHub REST API on schedule — set the time directly
+# in Bangkok time there (e.g. 08:00 / 14:00 / 20:00 / 02:00 for a 6-hourly load):
+#   POST https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/de-ingest.yml/dispatches
+#   headers: Authorization: Bearer <PAT>, Accept: application/vnd.github+json,
+#            X-GitHub-Api-Version: 2022-11-28 ; body {"ref":"main"}
 
 on:
-  schedule:
-    # - cron: '0 1 * * *'   # 1:00 AM UTC = 8:00 AM Bangkok time (ICT, UTC+7, no DST)
-    - cron: '8 1,7,13,19 * * *'
-  workflow_dispatch:        # manual run button
+  workflow_dispatch:          # manual button + cron-job.org API dispatch target
+  repository_dispatch:
+    types: [de-ingest]        # alternative external-cron trigger
 
 jobs:
   ingest:
