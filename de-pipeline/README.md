@@ -329,3 +329,40 @@ dbt build --full-refresh --target dev --profiles-dir .            # rebuilds eve
 ```
 
 > Skip `reset_snapshots` unless you specifically want to lose the accumulated coin-attribute history — a normal `--full-refresh` already reloads all the actual data.
+
+### 3.6 Schedule the dbt run with cron-job.org (external cron)
+
+The scheduled dbt run is `.github/workflows/dbt-run.yml`. It has **no GitHub `schedule:` trigger** — GitHub's built-in cron is delayed/dropped under load — so an external scheduler, **cron-job.org**, fires it on time by calling the GitHub REST API (`workflow_dispatch`). The same workflow also runs on PRs and merges (see the project plan's Step 5b); cron-job.org only drives the daily run.
+
+**1. Create a GitHub token (PAT).** GitHub → Settings → Developer settings → **Fine-grained personal access tokens** → Generate:
+- **Repository access:** only `coin-dwh-ml`.
+- **Permissions → Actions: Read and write** (this is what allows dispatching a workflow).
+- Copy the token — you'll paste it into cron-job.org, nowhere else. (A classic PAT also works; it needs the `workflow` scope.)
+
+**2. (optional) Confirm it works** from your machine before wiring the scheduler — a `204 No Content` means success and a run should appear in the Actions tab:
+
+```bash
+curl -i -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer <PAT>" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-run.yml/dispatches \
+  -d '{"ref":"main"}'
+```
+
+**3. Create the cron-job.org job** (Console → **Create cronjob**):
+
+| Field | Value |
+|---|---|
+| Title | `dbt build (dev)` |
+| URL | `https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-run.yml/dispatches` |
+| Schedule | e.g. every day at **08:30**, timezone **Asia/Bangkok** (cron-job.org has a timezone selector — no UTC math) |
+| Request method | **POST** (under "Advanced" / request settings) |
+| Request body | `{"ref":"main"}` |
+| Headers | `Accept: application/vnd.github+json`  ·  `Authorization: Bearer <PAT>`  ·  `X-GitHub-Api-Version: 2022-11-28`  ·  `Content-Type: application/json` |
+
+Notes:
+- **`ref` must be the default branch** (`main`) and `dbt-run.yml` must exist on it — `workflow_dispatch` only dispatches from the default branch.
+- GitHub returns **`204 No Content`** on success (empty body); treat any `2xx` as OK in cron-job.org. A `401`/`403` means the PAT is wrong or missing the Actions permission; `404` usually means a wrong `<owner>`/repo/workflow filename or a token without access.
+- cron-job.org sends a `User-Agent` automatically (GitHub requires one); if you ever get a `403` about a missing User-Agent, add `User-Agent: cron-job.org` to the headers.
+- The workflow authenticates to Snowflake with the same `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` repo secrets used elsewhere — those must be set (project plan Step 6) for the dispatched run to succeed.
