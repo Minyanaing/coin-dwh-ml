@@ -71,6 +71,7 @@ df = load_daily_prices(DATABASE, selected)
 if df.empty:
     st.info("Pick at least one coin to plot.")
 else:
-    # one colored trend line per coin, with a legend
-    st.line_chart(df, x="PRICE_DATE", y="PRICE_USD", color="SYMBOL")
+    # wide frame (one column per coin) -> one line each, with a legend
+    chart = df.pivot_table(index="PRICE_DATE", columns="SYMBOL", values="PRICE_USD").sort_index()
+    st.line_chart(chart)
     st.caption(f"Source: {DATABASE}.{SCHEMA}.fct_daily_market · daily close (USD)")
