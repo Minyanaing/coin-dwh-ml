@@ -43,16 +43,14 @@ def run_file(cur, path: str) -> None:
             raise SystemExit(f"{path} needs STREAMLIT_ENV set (DEV/QA/PROD)")
         sql = sql.replace("${STREAMLIT_ENV}", env)
 
-    statements = [s.strip() for s in sql.split(";")]
-    for statement in statements:
+    # Drop line comments first so a ';' inside a comment can't split a statement.
+    sql = "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+
+    for statement in sql.split(";"):
+        statement = statement.strip()
         if not statement:
             continue
-        code_lines = [
-            line for line in statement.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
-        preview = code_lines[0][:80] if code_lines else statement.splitlines()[0][:80]
-        print(f"  -> {preview}")
+        print(f"  -> {statement.splitlines()[0][:80]}")
         cur.execute(statement)
 
 
