@@ -24,3 +24,8 @@ jobs:
       # and without forcing a specific formatting style on the DDL.
       - name: Validate Snowflake SQL syntax
         run: sqlfluff parse de-pipeline/snowflake --dialect snowflake
+
+      # streamlit-setup.sql is skipped by sqlfluff (.sqlfluffignore); byte-compile
+      # the Streamlit app instead so a broken app.py can't merge.
+      - name: Validate Streamlit app syntax
+        run: python -m py_compile de-pipeline/snowflake/streamlit/app.py

@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-streamlit/
 .keys/
 
 # Local ingestion secrets/output
