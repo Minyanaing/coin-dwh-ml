@@ -1,43 +1,41 @@
 name: dbt promote (qa / prod)
 
-# Step 6 — promotes the dbt project to QA or PROD by re-running the SAME models
-# against a different database. Promotion is not a data copy — each target
-# rebuilds a full, independent medallion + star schema from the shared landing
-# zone CRYPTO_DB.STG. Dev is built continuously by dbt-run.yml (Step 5b).
+# Promotes the dbt project to QA or PROD, where **the environment IS the branch**:
+#   main_qa   -> builds QA_DB
+#   main_prod -> builds PROD_DB
 #
-# ONE parameterized workflow, not a qa->prod chain. Every target shares the
-# exact same credentials/secrets — the ONLY thing that changes per environment
-# is the `target` input, which picks the database via profiles.yml
-# (qa -> QA_DB, prod -> PROD_DB). So there are no per-env secrets or env vars.
+# This gives real isolation: a change pushed to `main` (dev) does NOT reach qa or
+# prod. Each environment runs the code frozen on its own branch, and you promote
+# only by merging forward:  main -> main_qa -> main_prod. The dbt `--target` is
+# derived from the branch name, so the branch you run on fully decides the target
+# database — there is no input that could point qa code at the prod database.
 #
-# Set up a SEPARATE cron-job.org schedule per environment, each POSTing a
-# different `target` input (each env can have its own time):
-#   qa   : body {"ref":"main","inputs":{"target":"qa"}}
-#   prod : body {"ref":"main","inputs":{"target":"prod"}}
-# POST to (no GitHub `schedule:` — unreliable, only fires from default branch):
-#   https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-promote.yml/dispatches
+# Runs when:
+#   * push to main_qa / main_prod touching de-pipeline/dbt/**  (a promotion merge), or
+#   * external cron (cron-job.org) / manual dispatch on that branch.
+#
+# cron-job.org selects the environment purely by the branch in `ref`:
+#   qa   -> body {"ref":"main_qa"}
+#   prod -> body {"ref":"main_prod"}
+# POST https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-promote.yml/dispatches
 #   headers: Authorization: Bearer <PAT>, Accept: application/vnd.github+json,
 #            X-GitHub-Api-Version: 2022-11-28
 #
-# Gating: the job's GitHub Environment is set to the chosen target, so per-env
-# required reviewers (Settings -> Environments -> qa / prod) still gate the run;
-# with no reviewers it proceeds straight through.
+# NOTE: workflow_dispatch requires this file to exist on the **default branch**
+# (main); GitHub then runs the copy that lives on whatever branch you dispatch.
+# Keep the env branches current by merging main forward into them.
 #
 # Auth: DEVELOPER_SVC key-pair (matches profiles.yml), role SYSADMIN, which owns
-# QA_DB and PROD_DB and can read the shared CRYPTO_DB.STG landing tables.
+# QA_DB and PROD_DB and reads the shared CRYPTO_DB.STG landing tables.
 
 on:
-  workflow_dispatch:
-    inputs:
-      target:
-        description: 'dbt target to build (which environment database)'
-        type: choice
-        options:
-          - qa
-          - prod
-        default: qa
+  workflow_dispatch:            # manual (pick branch main_qa/main_prod) + cron-job.org target
   repository_dispatch:
-    types: [dbt-promote]        # external cron; send client_payload {"target":"qa|prod"}
+    types: [dbt-promote]        # alternative external-cron trigger
+  push:
+    branches: [main_qa, main_prod]   # a promotion merge rebuilds that environment
+    paths:
+      - 'de-pipeline/dbt/**'
 
 permissions:
   contents: read
@@ -50,15 +48,11 @@ env:
 
 jobs:
   promote:
-    # One job, parameterized by the `target` input (workflow_dispatch) or
-    # client_payload.target (repository_dispatch). The GitHub Environment is set
-    # to the same name so per-env reviewers gate it; the credentials above are
-    # identical for every target.
-    name: dbt build -> ${{ github.event.inputs.target || github.event.client_payload.target }}
+    name: dbt build (${{ github.ref_name }})
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.target || github.event.client_payload.target }}
-    env:
-      DBT_TARGET: ${{ github.event.inputs.target || github.event.client_payload.target }}
+    # GitHub Environment named after the branch (main_qa / main_prod) — add
+    # Required Reviewers there for a second approval gate if you want one.
+    environment: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -68,14 +62,17 @@ jobs:
       - name: Install dbt
         run: pip install dbt-snowflake==1.7.0
 
-      - name: Validate target
-        # Guard against an empty/invalid target (e.g. a repository_dispatch with
-        # no client_payload.target). profiles.yml only defines qa and prod here.
+      - name: Resolve dbt target from branch
+        id: t
+        # The branch is the single source of truth for which DB is built.
         run: |
-          if [ "$DBT_TARGET" != "qa" ] && [ "$DBT_TARGET" != "prod" ]; then
-            echo "::error::target must be 'qa' or 'prod' (got '$DBT_TARGET'). For repository_dispatch, send client_payload {\"target\":\"qa|prod\"}."
-            exit 1
-          fi
+          case "${{ github.ref_name }}" in
+            main_qa)   echo "target=qa"   >> "$GITHUB_OUTPUT" ;;
+            main_prod) echo "target=prod" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::dbt-promote must run on 'main_qa' or 'main_prod' (got '${{ github.ref_name }}'). Dispatch with body {\"ref\":\"main_qa\"} or {\"ref\":\"main_prod\"}."
+              exit 1 ;;
+          esac
 
       - name: Write DEVELOPER_SVC private key
         env:
@@ -84,8 +81,8 @@ jobs:
           mkdir -p de-pipeline/.keys
           printf '%s' "$PRIVATE_KEY" > de-pipeline/.keys/rsa_key.p8
 
-      - name: dbt build (target ${{ env.DBT_TARGET }})
+      - name: dbt build (target ${{ steps.t.outputs.target }})
         working-directory: de-pipeline/dbt
         run: |
           dbt deps --profiles-dir .
-          dbt build --target "$DBT_TARGET" --profiles-dir .
+          dbt build --target ${{ steps.t.outputs.target }} --profiles-dir .
