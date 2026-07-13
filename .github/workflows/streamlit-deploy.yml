@@ -1,0 +1,59 @@
+name: Streamlit deploy
+
+# Branch = environment (same model as dbt-promote.yml):
+#   main       -> STREAMLIT_DB.STREAMLIT_DEV.CRYPTO_PRICES_DEV
+#   main_qa    -> STREAMLIT_DB.STREAMLIT_QA.CRYPTO_PRICES_QA
+#   main_prod  -> STREAMLIT_DB.STREAMLIT_PROD.CRYPTO_PRICES_PROD
+# Uploads app.py to that env's own stage and CREATE OR REPLACEs only that env's
+# app, so a merge to one branch never touches another environment. All apps read
+# PROD_DB by default (switchable in-app). Auth: DEVELOPER_SVC key-pair.
+
+on:
+  push:
+    branches: [main, main_qa, main_prod]
+    paths:
+      - 'de-pipeline/snowflake/streamlit/**'
+      - 'de-pipeline/snowflake/streamlit-setup.sql'
+      - 'de-pipeline/snowflake/run_sql.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Streamlit app (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r de-pipeline/snowflake/requirements.txt
+
+      - name: Resolve environment from branch
+        id: env
+        run: |
+          case "${{ github.ref_name }}" in
+            main)      echo "streamlit_env=DEV"  >> "$GITHUB_OUTPUT" ;;
+            main_qa)   echo "streamlit_env=QA"   >> "$GITHUB_OUTPUT" ;;
+            main_prod) echo "streamlit_env=PROD" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::streamlit-deploy must run on main / main_qa / main_prod (got '${{ github.ref_name }}')."
+              exit 1 ;;
+          esac
+
+      - name: Upload app.py + create/replace the app
+        working-directory: de-pipeline/snowflake
+        env:
+          STREAMLIT_ENV:                ${{ steps.env.outputs.streamlit_env }}
+          SNOWFLAKE_ACCOUNT:            ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_DEV_SVC_USER:       ${{ secrets.SNOWFLAKE_DEV_SVC_USER }}
+          SNOWFLAKE_DEV_SVC_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_DEV_SVC_PRIVATE_KEY }}
+        run: |
+          python run_sql.py \
+            "put:streamlit/app.py=@STREAMLIT_DB.STREAMLIT_${STREAMLIT_ENV}.CRYPTO_APP_STAGE" \
+            streamlit-setup.sql
