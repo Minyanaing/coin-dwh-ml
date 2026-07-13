@@ -1,0 +1,6 @@
+# Local dev for the Streamlit app (snowflake/streamlit/app.py).
+# Install into a SEPARATE venv (.venv-streamlit) — these conflict with dbt's venv.
+streamlit==1.59.1
+snowflake-snowpark-python==1.53.0
+pandas==3.0.3
+altair==6.2.2
