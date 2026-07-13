@@ -14,6 +14,7 @@ flowchart LR
   GOLD --> APP["Streamlit dashboard"]
   STG -. same models, per env .-> ENV["DEV_DB · QA_DB · PROD_DB"]
 ```
+![Diagram](./docs/diagram-export.png)
 
 ## What it's for
 
@@ -82,3 +83,4 @@ de-pipeline/
 
 - **Setup & run guide (start here):** [`de-pipeline/README.md`](./de-pipeline/README.md)
 - **Design doc / rationale:** [`.claude/crypto-de-pipeline-project-plan.md`](./.claude/crypto-de-pipeline-project-plan.md)
+.md)
