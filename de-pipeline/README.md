@@ -713,3 +713,97 @@ Create two cron-job.org jobs, identical except for **Schedule** and **Request bo
 The **`ref` is the whole switch** — GitHub runs `dbt-promote.yml` from that branch and the workflow maps `main_qa → --target qa`, `main_prod → --target prod`. Reuse the **same PAT** from §3.6 (fine-grained, **Actions: Read and write**); the `204`/`401`/`403`/`404` and `User-Agent` notes there apply here too. If Required Reviewers are set on the branch's Environment, the run waits on approval before building.
 
 > You can also promote by hand any time: **Actions → dbt promote (qa / prod) → Run workflow → pick branch `main_qa` or `main_prod`** (the branch decides the target).
+
+---
+
+## 5. Streamlit dashboard (`snowflake/streamlit/app.py`)
+
+A dashboard built with **Streamlit in Snowflake** ([`snowflake/streamlit/app.py`](snowflake/streamlit/app.py)), reading from **`PROD_DB.GOLD_CRYPTO`** (the clean, promoted data) whichever environment the app belongs to.
+
+**Deployment is separated per environment by branch** (same model as `dbt-promote.yml`): each env has its own app object in a dedicated `STREAMLIT_DB`, deployed only when its branch changes.
+
+| Branch | App object | Data source |
+|---|---|---|
+| `main` | `STREAMLIT_DB.STREAMLIT_DEV.CRYPTO_PRICES_DEV` | `PROD_DB` |
+| `main_qa` | `STREAMLIT_DB.STREAMLIT_QA.CRYPTO_PRICES_QA` | `PROD_DB` |
+| `main_prod` | `STREAMLIT_DB.STREAMLIT_PROD.CRYPTO_PRICES_PROD` | `PROD_DB` |
+
+### 5.1 Run & test locally
+
+Streamlit + Snowpark need their **own** virtualenv — their `snowflake-connector-python` pin conflicts with dbt's, so **don't reuse** the `.venv` from §2/§3. Dependencies are pinned in [`snowflake/streamlit-requirements.txt`](snowflake/streamlit-requirements.txt).
+
+```cmd
+:: Windows cmd — from de-pipeline
+python -m venv .venv-streamlit
+.venv-streamlit\Scripts\activate.bat
+pip install -r snowflake\streamlit-requirements.txt
+```
+
+```bash
+# Linux / macOS — from de-pipeline
+python -m venv .venv-streamlit
+source .venv-streamlit/bin/activate
+pip install -r snowflake/streamlit-requirements.txt
+```
+
+Outside Snowflake the app builds a Snowpark session from the **same `DEVELOPER_SVC` key-pair vars** as dbt (§3.2):
+
+| Env var | Required | Purpose |
+|---|---|---|
+| `SNOWFLAKE_ACCOUNT` | yes | account identifier |
+| `SNOWFLAKE_USER` | yes | `DEVELOPER_SVC` |
+| `SNOWFLAKE_PRIVATE_KEY_PATH` | yes (local) | path to `.keys/rsa_key.p8` |
+| `SNOWFLAKE_ROLE` | no (default `SYSADMIN`) | role queries run as |
+| `SNOWFLAKE_WAREHOUSE` | no (default `CRYPTO_WH`) | warehouse for the queries |
+
+```cmd
+:: Windows cmd — from de-pipeline/snowflake/streamlit
+set SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+set SNOWFLAKE_USER=DEVELOPER_SVC
+set SNOWFLAKE_PRIVATE_KEY_PATH=..\..\.keys\rsa_key.p8
+set SNOWFLAKE_ROLE=SYSADMIN
+set SNOWFLAKE_WAREHOUSE=CRYPTO_WH
+streamlit run app.py
+```
+
+```bash
+# Linux / macOS — from de-pipeline/snowflake/streamlit
+export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
+export SNOWFLAKE_USER=DEVELOPER_SVC
+export SNOWFLAKE_PRIVATE_KEY_PATH=../../.keys/rsa_key.p8
+export SNOWFLAKE_ROLE=SYSADMIN
+export SNOWFLAKE_WAREHOUSE=CRYPTO_WH
+streamlit run app.py
+```
+
+Opens `http://localhost:8501`. Needs data in `PROD_DB.GOLD_CRYPTO` (promote first — §4); otherwise the coin list is empty.
+
+> `app.py` calls `get_active_session()` when it runs inside Snowflake; locally that fails and it falls back to the session built from the vars above. The **same file** runs in both places — so test locally, then deploy unchanged.
+
+### 5.2 Deploy to Snowflake
+
+**Auto (branch = environment).** `streamlit-deploy.yml` fires on a push to `main` / `main_qa` / `main_prod` that touches the streamlit files (or **Actions → Streamlit deploy → Run workflow**). It resolves the env from the branch, uploads `app.py` to that env's stage, and `CREATE OR REPLACE`s **only that env's** app:
+
+| Merge to | Deploys |
+|---|---|
+| `main` | `CRYPTO_PRICES_DEV` |
+| `main_qa` | `CRYPTO_PRICES_QA` |
+| `main_prod` | `CRYPTO_PRICES_PROD` |
+
+It reuses the `DEVELOPER_SVC` secrets from §1.3 (no new secrets); the first run also creates `STREAMLIT_WH`, `STREAMLIT_DB`, the schema, and the stage.
+
+**Manual / first-time.** From `de-pipeline/snowflake/` (with the §1.3 key-pair vars in your shell), set `STREAMLIT_ENV` and run:
+
+```bash
+STREAMLIT_ENV=DEV python run_sql.py \
+  put:streamlit/app.py=@STREAMLIT_DB.STREAMLIT_DEV.CRYPTO_APP_STAGE \
+  streamlit-setup.sql
+```
+
+Swap `DEV` → `QA` / `PROD` for the others. Order matters: the `put:` step uploads `app.py` **first**, then `streamlit-setup.sql` runs `CREATE OR REPLACE STREAMLIT`, which requires the file already on the stage.
+
+> `streamlit-setup.sql` is **not** applied by `infra-deploy.yml` and is skipped by `infra-ci`'s sqlfluff check (`.sqlfluffignore`) — Streamlit has its own workflow.
+
+### 5.3 Open the app
+
+In Snowsight: **left nav → Streamlit → `CRYPTO_PRICES_DEV` / `_QA` / `_PROD`** (under `STREAMLIT_DB`). Anyone holding `CRYPTO_PIPELINE_ROLE` (granted in `streamlit-setup.sql`) can open them; the app runs with its owner's rights, so it can read `PROD_DB`.
