@@ -18,11 +18,13 @@ The workflows in [`.github/workflows/`](../.github/workflows/):
 | `infra-deploy.yml` | apply `setup.sql` / `streams.sql` / `tasks.sql` to Snowflake | merge to `main` + manual |
 | `de-ingest.yml` | ingest CoinGecko snapshot → `CRYPTO_DB.STG` | external cron (cron-job.org) + manual |
 | `de-ingest-history.yml` | one-off historical backfill | manual only |
-| `dbt-run.yml` | build + test dbt into `DEV_DB` | PR + merge + external cron |
-| `dbt-promote.yml` | build `QA_DB` **or** `PROD_DB` (chosen by `target` input) | external cron (one job per env) + manual |
+| `dbt-run.yml` | build + test dbt into `DEV_DB` (dev = `main` branch) | PR + merge to `main` + external cron |
+| `dbt-promote.yml` | build `QA_DB` / `PROD_DB` — target chosen by the **branch** (`main_qa` / `main_prod`) | merge to that branch + external cron |
 | `dbt-snowflake.yml` | Snowflake-native dbt (Step 5a) — **disabled**, needs a billed account | — |
 
 Two Snowflake identities: **`DEVELOPER_SVC`** (a `TYPE=SERVICE` key-pair account, `SYSADMIN`+`USERADMIN`) is what every CI workflow authenticates as; **`CRYPTO_PIPELINE_ROLE`** is a narrower data-plane role used only for optional local password auth.
+
+**The environment is the branch.** `main` → `DEV_DB`, `main_qa` → `QA_DB`, `main_prod` → `PROD_DB`. Each environment runs the code **frozen on its own branch**, so a change pushed to `main` (dev) does *not* reach qa/prod — you promote it by merging forward: `main → main_qa → main_prod`. See [§4](#4-promote-to-qa-and-prod-dbt-promoteyml).
 
 ## Data flow — databases, schemas & tables
 
@@ -152,26 +154,28 @@ Once the one-time setup below is done, the pipeline runs itself. Work reaches Sn
 **A. Scheduled (production) — external cron via cron-job.org.** GitHub's built-in `schedule:` is delayed/dropped under load and only fires from the default branch, so instead cron-job.org POSTs to each workflow's REST dispatch endpoint on time (set directly in Bangkok time). The daily flow is staggered so each stage's inputs have landed:
 
 ```
-08:00  de-ingest.yml    →  CoinGecko snapshot → CRYPTO_DB.STG.COINGECKO_RAW   (repeats every 6h)
-08:30  dbt-run.yml      →  dbt build --target dev   → DEV_DB    (Silver + Gold + tests)
-09:00  dbt-promote.yml  →  dbt build --target qa    → QA_DB     (gated by "qa" reviewers, if set)
-10:00  dbt-promote.yml  →  dbt build --target prod  → PROD_DB   (gated by "prod" reviewers, if set)
+08:00  de-ingest.yml   ref=main        →  CoinGecko snapshot → CRYPTO_DB.STG.COINGECKO_RAW  (repeats every 6h)
+08:30  dbt-run.yml      ref=main        →  dbt build --target dev   → DEV_DB    (Silver + Gold + tests)
+09:00  dbt-promote.yml  ref=main_qa     →  dbt build --target qa    → QA_DB
+10:00  dbt-promote.yml  ref=main_prod   →  dbt build --target prod  → PROD_DB
 ```
 
-The stages are independent workflows (no hard `needs:` across them) — the stagger is a loose coupling, not a dependency. Because Silver/Gold are incremental, a late or missed upstream run just means that cycle merges fewer new rows rather than breaking.
+The cron job selects the environment **by the branch in `ref`** — `dbt-promote.yml` maps `main_qa → --target qa` and `main_prod → --target prod`. The stages are independent workflows (no hard `needs:`) — the stagger is a loose coupling, and because Silver/Gold are incremental, a late or missed upstream run just means that cycle merges fewer new rows rather than breaking.
 
-**B. On code change — GitHub-native CI/CD (PR + merge to `main`).**
+**B. On code change — GitHub-native CI/CD (branch = environment).** A push only rebuilds the environment whose branch you pushed to, so dev changes never leak into qa/prod:
 
 | You do | GitHub runs |
 |---|---|
-| Open a PR touching `de-pipeline/snowflake/**` | `infra-ci.yml` — `sqlfluff` parse (no credentials) |
+| Open a PR into `main` touching `de-pipeline/snowflake/**` | `infra-ci.yml` — `sqlfluff` parse (no credentials) |
 | Merge to `main` touching `de-pipeline/snowflake/**` | `infra-deploy.yml` — apply the SQL to Snowflake |
-| Open a PR touching `de-pipeline/dbt/**` | `dbt-run.yml` **ci** — `dbt build` + tests on `DEV_DB` |
-| Merge to `main` touching `de-pipeline/dbt/**` | `dbt-run.yml` **deploy-dev** — rebuild `DEV_DB` |
+| Open a PR into `main` touching `de-pipeline/dbt/**` | `dbt-run.yml` **ci** — `dbt build` + tests on `DEV_DB` |
+| Merge to `main` touching `de-pipeline/dbt/**` | `dbt-run.yml` — rebuild `DEV_DB` |
+| Merge `main → main_qa` (promote) | `dbt-promote.yml` — rebuild `QA_DB` |
+| Merge `main_qa → main_prod` (promote) | `dbt-promote.yml` — rebuild `PROD_DB` |
 
-**C. Manual — any time.** Every workflow has a **Run workflow** button (**GitHub repo → Actions → _workflow_ → Run workflow**); for `dbt-promote.yml` pick the `qa` or `prod` target from the dropdown. Ingestion and dbt also run locally (sections 2–3).
+**C. Manual — any time.** Every workflow has a **Run workflow** button (**GitHub repo → Actions → _workflow_ → Run workflow**); for `dbt-promote.yml` **pick the branch** `main_qa` or `main_prod` (the branch decides the target). Ingestion and dev dbt also run locally (sections 2–3).
 
-> **Promotion gates:** QA/PROD builds pause for a manual **Approve** click only if you add Required Reviewers to the `qa` / `prod` GitHub Environments (section 4.2). With no reviewers, they run straight through.
+> **Two promotion gates:** (1) **branch protection** on `main_qa` / `main_prod` requires a reviewed PR to merge code forward; (2) optional **Required Reviewers** on the `main_qa` / `main_prod` GitHub Environments pause the build for an Approve click (section 4.2).
 
 ## Quickstart — stand up a new Snowflake account (~10 minutes)
 
@@ -229,11 +233,22 @@ GRANT MANAGE GRANTS ON ACCOUNT TO ROLE SYSADMIN;   -- else GRANT ... ON FUTURE .
 
 Before automating, prove the path end-to-end from your machine: load one ingestion into Snowflake (**§2.1 → §2.3**), then run a dbt build (**§3.1 → §3.4**). You should see rows in `CRYPTO_DB.STG.COINGECKO_RAW` and models in `DEV_DB.SILVER_CRYPTO` / `DEV_DB.GOLD_CRYPTO`.
 
-### Step 6 — Turn on automation (scheduling) · _detail: §4.2, then §2.4 / §3.6 / §4.3_
+### Step 6 — Create the environment branches · _detail: §4.2_
 
-1. Create GitHub **Environments** `qa` and `prod` — add **Required Reviewers** on any you want to gate for manual approval (**§4.2**).
-2. Create one fine-grained GitHub **PAT** (**Actions: Read and write**) for the scheduler (**§3.6 step 1**).
-3. Create the **cron-job.org** jobs, staggered: ingestion (**§2.4**) → dev build (**§3.6**) → qa & prod promotion (**§4.3**).
+Create the qa/prod branches off `main` (this is where their code lives — see §4.2):
+
+```bash
+git checkout main && git pull
+git branch main_qa   && git push -u origin main_qa
+git branch main_prod && git push -u origin main_prod
+```
+
+Optionally protect `main_qa` / `main_prod` (**repo → Settings → Branches**) so promotion needs a reviewed PR, and create GitHub **Environments** named `main_qa` / `main_prod` if you want a second Approve gate.
+
+### Step 7 — Turn on automation (scheduling) · _detail: §2.4 / §3.6 / §4.4_
+
+1. Create one fine-grained GitHub **PAT** (**Actions: Read and write**) for the scheduler (**§3.6 step 1**).
+2. Create the **cron-job.org** jobs, staggered, one per environment — each points at its **branch** via `ref`: ingestion `main` (**§2.4**) → dev build `main` (**§3.6**) → qa `main_qa` & prod `main_prod` (**§4.4**).
 
 **Done — the pipeline now runs itself.** See [How the deployment flow runs](#how-the-deployment-flow-runs-after-setup) above for exactly what fires when.
 
@@ -441,7 +456,7 @@ See [`ingest_coingecko.py`](ingestion/ingest_coingecko.py) and [`config.py`](ing
 
 ### 2.4 Schedule ingestion in production (cron-job.org)
 
-In production the ingestion runs on GitHub Actions (`.github/workflows/de-ingest.yml`) — the same `INGEST_MODE=snowflake` run as section 2.3, authenticating as the `DEVELOPER_SVC` key-pair. It has **no GitHub `schedule:` trigger** (GitHub's built-in cron is delayed/dropped under load and only fires from the default branch), so an external scheduler — **cron-job.org** — fires it by calling the GitHub REST API (`workflow_dispatch`). Same mechanism as the dbt workflows in §3.6 / §4.3.
+In production the ingestion runs on GitHub Actions (`.github/workflows/de-ingest.yml`) — the same `INGEST_MODE=snowflake` run as section 2.3, authenticating as the `DEVELOPER_SVC` key-pair. It has **no GitHub `schedule:` trigger** (GitHub's built-in cron is delayed/dropped under load and only fires from the default branch), so an external scheduler — **cron-job.org** — fires it by calling the GitHub REST API (`workflow_dispatch`). Same mechanism as the dbt workflows in §3.6 / §4.4.
 
 **1. Reuse (or create) the GitHub PAT.** The same fine-grained token used in §3.6 works here — **Repository access:** `coin-dwh-ml`, **Permissions → Actions: Read and write**. It lives only in cron-job.org, never in the repo. (If you haven't made one yet, see §3.6 step 1.)
 
@@ -460,7 +475,7 @@ Notes:
 - **`ref` must be the default branch** (`main`) and `de-ingest.yml` must exist on it — `workflow_dispatch` only dispatches from the default branch.
 - GitHub returns **`204 No Content`** on success; the `204`/`401`/`403`/`404` and `User-Agent` notes from §3.6 apply here too.
 - The run needs the `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` repo secrets from §1.3 to reach Snowflake.
-- Stagger the dbt schedules (§3.6 / §4.3) **after** the ingestion slot so each day's rows have landed before dbt builds on top.
+- Stagger the dbt schedules (§3.6 / §4.4) **after** the ingestion slot so each day's rows have landed before dbt builds on top.
 
 ---
 
@@ -630,19 +645,46 @@ Notes:
 
 ## 4. Promote to QA and PROD (`dbt-promote.yml`)
 
-Section 3 builds **dev** (`DEV_DB`). Promotion re-runs the *same* models against `QA_DB` or `PROD_DB` — there's no data copy, just a different dbt `--target`. `dbt-promote.yml` is **one parameterized workflow**: it takes a `target` input (`qa` or `prod`) and builds that one database, so QA and PROD share identical credentials and differ only by which target you dispatch. `dbt/profiles.yml` has three targets sharing one connection (the `DEVELOPER_SVC` key-pair); only the database differs:
+Section 3 builds **dev** (`DEV_DB`) from `main`. QA and PROD are **separate branches** — `main_qa` and `main_prod` — and `dbt-promote.yml` builds whichever one it runs on. Same models, same credentials; the branch decides the target database:
 
-| Target | Database | Selected by |
-|---|---|---|
-| `dev` (default) | `DEV_DB` | `dbt build --target dev` |
-| `qa` | `QA_DB` | `dbt build --target qa` |
-| `prod` | `PROD_DB` | `dbt build --target prod` |
+| Branch | dbt target | Database | Built by |
+|---|---|---|---|
+| `main` | `dev` | `DEV_DB` | `dbt-run.yml` (§3) |
+| `main_qa` | `qa` | `QA_DB` | `dbt-promote.yml` |
+| `main_prod` | `prod` | `PROD_DB` | `dbt-promote.yml` |
 
-All three read the same env vars from section 3.2 (`SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER=DEVELOPER_SVC`, `SNOWFLAKE_PRIVATE_KEY_PATH`, `SNOWFLAKE_ROLE`) — nothing extra to set. `SYSADMIN` owns all four databases, so the same key works everywhere.
+**Why branches?** Each environment runs the code **frozen on its branch**, so pushing a change to `main` (dev) does *not* touch qa/prod. You promote deliberately by merging forward — `main → main_qa → main_prod` — and only that merge rebuilds the next environment. `dbt/profiles.yml` still has all three targets sharing one `DEVELOPER_SVC` key-pair connection (env vars from §3.2); only the `database` differs, and `SYSADMIN` owns all four.
 
-### 4.1 Run a promotion locally (optional)
+### 4.1 Create the environment branches (one-time)
 
-From `de-pipeline/dbt/`, same as dev — just change `--target`:
+Branch off `main` and push. Promotion later is just a forward merge into these.
+
+```bash
+git checkout main && git pull
+git branch main_qa   && git push -u origin main_qa
+git branch main_prod && git push -u origin main_prod
+```
+
+> **Keep them in sync by merging forward only** (`main → main_qa → main_prod`); never edit `main_prod` directly, or the branches diverge. `workflow_dispatch` still requires the workflow to exist on the default branch `main` (it does) — GitHub then runs the copy of `dbt-promote.yml` that lives on whatever branch you dispatch.
+
+### 4.2 Promote & gate
+
+**Promote** by merging forward — each merge rebuilds that environment (a `push` to `main_qa`/`main_prod` touching `de-pipeline/dbt/**` triggers `dbt-promote.yml`):
+
+```bash
+# dev looks good -> promote to QA
+git checkout main_qa && git merge --ff-only main && git push      # rebuilds QA_DB
+# QA looks good -> promote to PROD
+git checkout main_prod && git merge --ff-only main_qa && git push  # rebuilds PROD_DB
+```
+
+**Gate** promotion two ways (both optional, both recommended for prod):
+- **Branch protection** (**repo → Settings → Branches**) on `main_qa` / `main_prod` — require a reviewed PR to merge, so code can't reach an environment unreviewed.
+- **GitHub Environments** — `dbt-promote.yml` sets `environment: ${{ github.ref_name }}`, so create Environments named **`main_qa`** and **`main_prod`** (**Settings → Environments**) and add **Required Reviewers** to pause the build for a manual Approve. No new secrets — it reuses the `DEVELOPER_SVC` key-pair from §1.3.
+
+### 4.3 Run a promotion locally (optional)
+
+From `de-pipeline/dbt/`, on the matching branch, just change `--target`:
 
 ```bash
 dbt build --target qa   --profiles-dir .    # build QA_DB
@@ -651,18 +693,9 @@ dbt build --target prod --profiles-dir .    # build PROD_DB
 
 Each target builds a complete, independent copy of `silver_crypto` + `gold_crypto` in its database from the shared `CRYPTO_DB.STG` landing tables.
 
-### 4.2 Create the `qa` and `prod` GitHub Environments (approval gates)
+### 4.4 Schedule each environment with its own cron-job.org job
 
-The promotion job sets its [GitHub Environment](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment) to whichever `target` it's building, so the matching environment's protection rules gate that run. Go to **GitHub repo → Settings → Environments** and create **`qa`** and **`prod`** (you likely already have `infra` from section 1). On each, add yourself/your team under **Required reviewers** so a promotion pauses for a manual **Approve** click:
-
-- a run with `target=qa` runs in the `qa` environment (build `QA_DB`).
-- a run with `target=prod` runs in the `prod` environment (build `PROD_DB`).
-
-With no reviewers configured, the run proceeds straight through with no pause. No new secrets are needed — `dbt-promote.yml` reuses the `DEVELOPER_SVC` key-pair secrets from section 1.3.
-
-### 4.3 Schedule each environment with its own cron-job.org job
-
-`dbt-promote.yml` builds **one** target per run, chosen by a `target` input, so QA and PROD get **separate** cron-job.org jobs — each on its own schedule and each sending a different `target`. Same mechanism, PAT, and headers as section 3.6; just add the input to the request body. Schedule both **after** the dev build so the day's rows have landed.
+`dbt-promote.yml` picks the target from the **branch in `ref`**, so QA and PROD get **separate** cron-job.org jobs that differ only by the branch they dispatch — **no `inputs` needed**. Same URL, PAT, and headers as §3.6; schedule both **after** the dev build so the day's rows have landed.
 
 Create two cron-job.org jobs, identical except for **Schedule** and **Request body**:
 
@@ -674,9 +707,9 @@ Create two cron-job.org jobs, identical except for **Schedule** and **Request bo
 
 | Cron job | Schedule (Asia/Bangkok) | Request body |
 |---|---|---|
-| `dbt promote (qa)` | e.g. **09:00** | `{"ref":"main","inputs":{"target":"qa"}}` |
-| `dbt promote (prod)` | e.g. **10:00** | `{"ref":"main","inputs":{"target":"prod"}}` |
+| `dbt promote (qa)` | e.g. **09:00** | `{"ref":"main_qa"}` |
+| `dbt promote (prod)` | e.g. **10:00** | `{"ref":"main_prod"}` |
 
-The `inputs` object is what selects the target — it works because the workflow declares a `workflow_dispatch` input named `target` and the file is on the default branch (`main`). Reuse the **same PAT** from section 3.6 (fine-grained, **Actions: Read and write**); the `204`/`401`/`403`/`404` and `User-Agent` notes there apply here too. When a job fires, the run starts and then **waits on that environment's reviewer approval** (if configured) before building.
+The **`ref` is the whole switch** — GitHub runs `dbt-promote.yml` from that branch and the workflow maps `main_qa → --target qa`, `main_prod → --target prod`. Reuse the **same PAT** from §3.6 (fine-grained, **Actions: Read and write**); the `204`/`401`/`403`/`404` and `User-Agent` notes there apply here too. If Required Reviewers are set on the branch's Environment, the run waits on approval before building.
 
-> You can also promote by hand any time: **Actions → dbt promote (qa / prod) → Run workflow → pick `qa` or `prod`**.
+> You can also promote by hand any time: **Actions → dbt promote (qa / prod) → Run workflow → pick branch `main_qa` or `main_prod`** (the branch decides the target).
