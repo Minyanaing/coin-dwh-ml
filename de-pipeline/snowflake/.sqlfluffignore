@@ -3,3 +3,8 @@
 # sqlfluff's snowflake dialect can't parse yet. It's reference SQL for a billed
 # account (Step 5a), never applied by infra-deploy.yml, so skip it in CI.
 dbt_project_task.sql
+
+# streamlit-setup.sql uses CREATE STREAMLIT DDL that sqlfluff's snowflake dialect
+# can't parse yet. Deployed by hand via run_sql.py (PUT app.py + this file), never
+# applied by infra-deploy.yml, so skip it in CI.
+streamlit-setup.sql
