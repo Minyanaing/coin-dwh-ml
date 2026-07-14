@@ -15,16 +15,20 @@ def get_session():
     # In Snowflake an active session exists; locally build one from env vars.
     try:
         from snowflake.snowpark.context import get_active_session
+
         return get_active_session()
     except Exception:
         from snowflake.snowpark import Session
-        return Session.builder.configs({
-            "account": os.environ["SNOWFLAKE_ACCOUNT"],
-            "user": os.environ["SNOWFLAKE_USER"],
-            "role": os.environ.get("SNOWFLAKE_ROLE", "SYSADMIN"),
-            "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH"),
-            "private_key_file": os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
-        }).create()
+
+        return Session.builder.configs(
+            {
+                "account": os.environ["SNOWFLAKE_ACCOUNT"],
+                "user": os.environ["SNOWFLAKE_USER"],
+                "role": os.environ.get("SNOWFLAKE_ROLE", "SYSADMIN"),
+                "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH"),
+                "private_key_file": os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+            }
+        ).create()
 
 
 session = get_session()
@@ -43,14 +47,17 @@ def date_bounds():
 
 @st.cache_data(ttl=600)
 def load_symbols() -> list[str]:
-    r = session.sql(f"select distinct symbol from {DIM} where is_current order by symbol").to_pandas()
+    r = session.sql(
+        f"select distinct symbol from {DIM} where is_current order by symbol"
+    ).to_pandas()
     return r["SYMBOL"].tolist()
 
 
 @st.cache_data(ttl=600)
 def load_cards(start, end) -> pd.DataFrame:
     # latest row per coin within the date range, highest price first
-    return session.sql(f"""
+    return session.sql(
+        f"""
         select symbol, price_usd, daily_return_pct from (
           select c.symbol, f.latest_price_usd as price_usd, f.daily_return_pct,
                  row_number() over (partition by c.coin_id order by f.price_date desc) rn
@@ -58,17 +65,20 @@ def load_cards(start, end) -> pd.DataFrame:
           where f.price_date between '{start}' and '{end}'
         ) where rn = 1
         order by price_usd desc
-    """).to_pandas()
+    """
+    ).to_pandas()
 
 
 @st.cache_data(ttl=600)
 def load_extremes() -> dict:
     # all-time high / low per coin (full history, ignores the date filter)
-    r = session.sql(f"""
+    r = session.sql(
+        f"""
         select c.symbol, max(f.latest_price_usd) ath, min(f.latest_price_usd) atl
         from {FCT} f join {DIM} c on f.coin_sk = c.coin_sk
         group by c.symbol
-    """).to_pandas()
+    """
+    ).to_pandas()
     return {row.SYMBOL: (row.ATH, row.ATL) for row in r.itertuples()}
 
 
@@ -77,12 +87,14 @@ def load_series(start, end, symbols: tuple) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
     in_list = ", ".join("'" + s.replace("'", "''") + "'" for s in symbols)
-    return session.sql(f"""
+    return session.sql(
+        f"""
         select f.price_date, c.symbol, f.latest_price_usd as price_usd
         from {FCT} f join {DIM} c on f.coin_sk = c.coin_sk
         where c.symbol in ({in_list}) and f.price_date between '{start}' and '{end}'
         order by f.price_date
-    """).to_pandas()
+    """
+    ).to_pandas()
 
 
 def price_str(v: float) -> str:
@@ -114,9 +126,9 @@ cards = load_cards(start, end)
 if cards.empty:
     st.info("No prices in the selected date range.")
 else:
-    per_row = (len(cards) + 1) // 2   # everything in two rows
+    per_row = (len(cards) + 1) // 2  # everything in two rows
     for i in range(0, len(cards), per_row):
-        chunk = cards.iloc[i:i + per_row]
+        chunk = cards.iloc[i : i + per_row]
         for col, (_, r) in zip(st.columns(per_row), chunk.iterrows()):
             ret = r["DAILY_RETURN_PCT"]
             delta = None if pd.isna(ret) else f"{ret:+.2f}%"
@@ -126,6 +138,7 @@ else:
 all_symbols = load_symbols()
 preferred = [s for s in ("BTC", "ETH", "SOL") if s in all_symbols]
 selected = st.sidebar.multiselect("Coins", all_symbols, default=preferred or all_symbols[:3])
+
 
 def coin_chart(sub: pd.DataFrame, ath, atl):
     # solid price line + dotted all-time-high / all-time-low reference lines
@@ -162,9 +175,9 @@ if not selected:
 else:
     extremes = load_extremes()
     series = load_series(start, end, tuple(selected))
-    per_row = min(len(selected), 4)   # 4 per row: 1 row for <=4, 2 rows for 5-8, etc.
+    per_row = min(len(selected), 4)  # 4 per row: 1 row for <=4, 2 rows for 5-8, etc.
     for i in range(0, len(selected), per_row):
-        row_syms = selected[i:i + per_row]
+        row_syms = selected[i : i + per_row]
         for col, sym in zip(st.columns(per_row), row_syms):
             with col:
                 st.markdown(f"**{sym}**")

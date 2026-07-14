@@ -5,11 +5,23 @@ snapshot) and backfill_coingecko_history.py (historical backfill) fetch the
 same way — same host/auth selection, same rate-limit handling.
 """
 
+import logging
 import time
 
 import requests
 
 import config
+
+logger = logging.getLogger(__name__)
+
+
+class CoinGeckoError(RuntimeError):
+    """Non-retryable CoinGecko API error (e.g. an out-of-window 401/403).
+
+    Raised so callers/entry points decide how to exit — the library never
+    terminates the process itself.
+    """
+
 
 # The public CoinGecko API rate-limits aggressively; go gently and back off on 429.
 REQUEST_SLEEP_SECONDS = 2.5
@@ -59,12 +71,14 @@ def fetch_history(coin_id: str, start_ts: int, end_ts: int) -> dict:
     for attempt in range(1, MAX_RETRIES + 1):
         resp = requests.get(url, params=params, headers=headers, timeout=60)
         if resp.status_code == 429:
-            wait = REQUEST_SLEEP_SECONDS * 2 ** attempt
-            print(f"  rate-limited on {coin_id}, retry {attempt}/{MAX_RETRIES} in {wait:.0f}s")
+            wait = REQUEST_SLEEP_SECONDS * 2**attempt
+            logger.warning(
+                "rate-limited on %s, retry %d/%d in %.0fs", coin_id, attempt, MAX_RETRIES, wait
+            )
             time.sleep(wait)
             continue
         if resp.status_code in (401, 403):
-            raise SystemExit(
+            raise CoinGeckoError(
                 f"\nCoinGecko returned {resp.status_code} for '{coin_id}' over "
                 f"{config.HISTORY_START_DATE}..today.\n"
                 "The keyless/Demo API only serves the past 365 days of market_chart "

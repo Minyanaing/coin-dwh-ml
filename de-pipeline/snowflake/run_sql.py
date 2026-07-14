@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -6,6 +7,8 @@ from pathlib import Path
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
+
+logger = logging.getLogger(__name__)
 
 
 def load_private_key_der(pem: str, passphrase: str | None) -> bytes:
@@ -23,13 +26,13 @@ def load_private_key_der(pem: str, passphrase: str | None) -> bytes:
 
 def get_connection():
     return snowflake.connector.connect(
-        account            = os.environ["SNOWFLAKE_ACCOUNT"],
-        user               = os.environ["SNOWFLAKE_DEV_SVC_USER"],
-        private_key        = load_private_key_der(
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        user=os.environ["SNOWFLAKE_DEV_SVC_USER"],
+        private_key=load_private_key_der(
             os.environ["SNOWFLAKE_DEV_SVC_PRIVATE_KEY"],
             os.environ.get("SNOWFLAKE_DEV_SVC_PRIVATE_KEY_PASSPHRASE"),
         ),
-        warehouse          = os.environ.get("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH"),
+        warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "CRYPTO_WH"),
     )
 
 
@@ -50,7 +53,7 @@ def run_file(cur, path: str) -> None:
         statement = statement.strip()
         if not statement:
             continue
-        print(f"  -> {statement.splitlines()[0][:80]}")
+        logger.info("  -> %s", statement.splitlines()[0][:80])
         cur.execute(statement)
 
 
@@ -72,9 +75,9 @@ def run_put(cur, spec: str) -> None:
         f"CREATE SCHEMA IF NOT EXISTS {db}.{schema}",
         f"CREATE STAGE IF NOT EXISTS {stage}",
     ):
-        print(f"  -> {stmt}")
+        logger.info("  -> %s", stmt)
         cur.execute(stmt)
-    print(f"  -> PUT {local_abs.name} @{stage}")
+    logger.info("  -> PUT %s @%s", local_abs.name, stage)
     cur.execute(f"PUT 'file://{local_abs}' @{stage} OVERWRITE = TRUE AUTO_COMPRESS = FALSE")
 
 
@@ -87,16 +90,18 @@ def main():
     parser.add_argument("steps", nargs="+", help="SQL files and/or put: specs, in order")
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
     conn = get_connection()
     try:
-        cur = conn.cursor()
-        for step in args.steps:
-            if step.startswith("put:"):
-                print(f"=== PUT {step[4:]} ===")
-                run_put(cur, step[4:])
-            else:
-                print(f"=== Running {step} ===")
-                run_file(cur, step)
+        with conn.cursor() as cur:
+            for step in args.steps:
+                if step.startswith("put:"):
+                    logger.info("=== PUT %s ===", step[4:])
+                    run_put(cur, step[4:])
+                else:
+                    logger.info("=== Running %s ===", step)
+                    run_file(cur, step)
     finally:
         conn.close()
 

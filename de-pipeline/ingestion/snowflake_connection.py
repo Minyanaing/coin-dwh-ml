@@ -37,16 +37,16 @@ def _load_private_key_der():
 
 def get_snowflake_conn():
     kwargs = dict(
-        account   = config.SNOWFLAKE_ACCOUNT,
-        user      = config.SNOWFLAKE_USER,
-        role      = config.SNOWFLAKE_ROLE,
-        warehouse = config.SNOWFLAKE_WAREHOUSE,
-        database  = config.SNOWFLAKE_DATABASE,
-        schema    = config.SNOWFLAKE_SCHEMA,
+        account=config.SNOWFLAKE_ACCOUNT,
+        user=config.SNOWFLAKE_USER,
+        role=config.SNOWFLAKE_ROLE,
+        warehouse=config.SNOWFLAKE_WAREHOUSE,
+        database=config.SNOWFLAKE_DATABASE,
+        schema=config.SNOWFLAKE_SCHEMA,
     )
     private_key_der = _load_private_key_der()
     if private_key_der is not None:
-        kwargs["private_key"] = private_key_der   # key-pair auth (e.g. DEVELOPER_SVC)
+        kwargs["private_key"] = private_key_der  # key-pair auth (e.g. DEVELOPER_SVC)
     else:
-        kwargs["password"] = config.SNOWFLAKE_PASSWORD   # password auth
+        kwargs["password"] = config.SNOWFLAKE_PASSWORD  # password auth
     return snowflake.connector.connect(**kwargs)
