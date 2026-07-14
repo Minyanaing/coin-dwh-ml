@@ -13,18 +13,27 @@ hand — locally, or via the manual-only de-ingest-history.yml workflow.
 """
 
 import csv
+import logging
 import os
 import time
 from datetime import datetime, timezone
 
 import config
-from fetch_data import REQUEST_SLEEP_SECONDS, fetch_coins, fetch_history
+from fetch_data import REQUEST_SLEEP_SECONDS, CoinGeckoError, fetch_coins, fetch_history
 from snowflake_connection import get_snowflake_conn
 from transforms import round5
 
+logger = logging.getLogger(__name__)
+
 FIELDNAMES = [
-    "id", "symbol", "name", "price_date",
-    "price", "market_cap", "total_volume", "fetched_at",
+    "id",
+    "symbol",
+    "name",
+    "price_date",
+    "price",
+    "market_cap",
+    "total_volume",
+    "fetched_at",
 ]
 
 
@@ -72,20 +81,26 @@ def save_history_to_snowflake(conn, rows: list[dict]) -> None:
             %(price)s, %(market_cap)s, %(total_volume)s, %(fetched_at)s
         )
     """
-    cur = conn.cursor()
-    cur.executemany(insert_sql, rows)
+    with conn.cursor() as cur:
+        cur.executemany(insert_sql, rows)
     conn.commit()
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     start_dt = datetime.fromisoformat(config.HISTORY_START_DATE).replace(tzinfo=timezone.utc)
     end_dt = datetime.now(timezone.utc)
     fetched_at = end_dt.isoformat()
     start_ts, end_ts = _to_unix(start_dt), _to_unix(end_dt)
 
     coins = fetch_coins()
-    print(f"Backfilling {len(coins)} coins from {config.HISTORY_START_DATE} to {end_dt.date()} "
-          f"(mode={config.INGEST_MODE})")
+    logger.info(
+        "backfilling %d coins from %s to %s (mode=%s)",
+        len(coins),
+        config.HISTORY_START_DATE,
+        end_dt.date(),
+        config.INGEST_MODE,
+    )
 
     conn = None
     csv_file = None
@@ -114,7 +129,7 @@ def main():
                 writer.writerows(rows)
 
             total += len(rows)
-            print(f"[{i}/{len(coins)}] {coin['id']}: {len(rows)} daily rows")
+            logger.info("[%d/%d] %s: %d daily rows", i, len(coins), coin["id"], len(rows))
             time.sleep(REQUEST_SLEEP_SECONDS)
     finally:
         if conn is not None:
@@ -122,10 +137,13 @@ def main():
         if csv_file is not None:
             csv_file.close()
 
-    dest = ("CRYPTO_DB.STG.COINGECKO_HISTORY_RAW"
-            if config.INGEST_MODE == "snowflake" else csv_path)
-    print(f"Done — {total} rows -> {dest}")
+    dest = "CRYPTO_DB.STG.COINGECKO_HISTORY_RAW" if config.INGEST_MODE == "snowflake" else csv_path
+    logger.info("done — %d rows -> %s", total, dest)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CoinGeckoError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(1)

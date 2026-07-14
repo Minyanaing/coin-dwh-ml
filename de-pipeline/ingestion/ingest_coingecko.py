@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -9,11 +10,24 @@ from fetch_data import fetch_coins
 from snowflake_connection import get_snowflake_conn
 from transforms import round5
 
+logger = logging.getLogger(__name__)
+
 FIELDNAMES = [
-    "id", "symbol", "name", "current_price", "market_cap", "total_volume",
-    "price_change_24h", "price_change_pct_24h", "high_24h", "low_24h",
-    "circulating_supply", "ath", "fetched_at",
+    "id",
+    "symbol",
+    "name",
+    "current_price",
+    "market_cap",
+    "total_volume",
+    "price_change_24h",
+    "price_change_pct_24h",
+    "high_24h",
+    "low_24h",
+    "circulating_supply",
+    "ath",
+    "fetched_at",
 ]
+
 
 def build_rows(coins: list, fetched_at: str) -> list[dict]:
     return [
@@ -35,6 +49,7 @@ def build_rows(coins: list, fetched_at: str) -> list[dict]:
         for c in coins
     ]
 
+
 def save_to_csv(rows: list[dict], fetched_at: str) -> str:
     os.makedirs(config.CSV_OUTPUT_DIR, exist_ok=True)
     stamp = fetched_at.replace("+00:00", "Z").replace(":", "").replace("-", "")
@@ -45,8 +60,9 @@ def save_to_csv(rows: list[dict], fetched_at: str) -> str:
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[local] Wrote {len(rows)} rows to {path}")
+    logger.info("[local] wrote %d rows to %s", len(rows), path)
     return path
+
 
 def save_to_json(coins: list, fetched_at: str) -> str:
     # Dump the full, untouched CoinGecko response — every field, no rounding or
@@ -58,8 +74,9 @@ def save_to_json(coins: list, fetched_at: str) -> str:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(coins, f, indent=2)
 
-    print(f"[local] Wrote {len(coins)} coins (full raw fields) to {path}")
+    logger.info("[local] wrote %d coins (full raw fields) to %s", len(coins), path)
     return path
+
 
 def save_to_snowflake(rows: list[dict]) -> None:
     insert_sql = f"""
@@ -75,15 +92,21 @@ def save_to_snowflake(rows: list[dict]) -> None:
     """
     conn = get_snowflake_conn()
     try:
-        cur = conn.cursor()
-        cur.executemany(insert_sql, rows)
+        with conn.cursor() as cur:
+            cur.executemany(insert_sql, rows)
         conn.commit()
-        print(f"[snowflake] Loaded {len(rows)} rows into "
-              f"{config.SNOWFLAKE_DATABASE}.{config.SNOWFLAKE_SCHEMA}.COINGECKO_RAW")
+        logger.info(
+            "[snowflake] loaded %d rows into %s.%s.COINGECKO_RAW",
+            len(rows),
+            config.SNOWFLAKE_DATABASE,
+            config.SNOWFLAKE_SCHEMA,
+        )
     finally:
         conn.close()
 
+
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(
         description="Fetch CoinGecko markets for the curated coin set."
     )
@@ -92,7 +115,7 @@ def main():
         choices=["csv", "json"],
         default="csv",
         help="Local output format (default: csv). 'json' writes the full raw "
-             "CoinGecko response (all fields). Ignored when INGEST_MODE=snowflake.",
+        "CoinGecko response (all fields). Ignored when INGEST_MODE=snowflake.",
     )
     args = parser.parse_args()
 
@@ -105,6 +128,7 @@ def main():
         save_to_json(coins, fetched_at)
     else:
         save_to_csv(build_rows(coins, fetched_at), fetched_at)
+
 
 if __name__ == "__main__":
     main()

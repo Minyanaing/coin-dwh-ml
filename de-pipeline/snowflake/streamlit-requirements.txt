@@ -4,3 +4,7 @@ streamlit==1.59.1
 snowflake-snowpark-python==1.53.0
 pandas==3.0.3
 altair==6.2.2
+
+# lint / format (dev + CI)
+black==24.10.0
+flake8==7.1.1

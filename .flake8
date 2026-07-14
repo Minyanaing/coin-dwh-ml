@@ -1,0 +1,10 @@
+[flake8]
+max-line-length = 100
+# E203/W503 conflict with black; E501 (line length) is owned by black.
+extend-ignore = E203, W503, E501
+exclude =
+    .venv,
+    .venv-streamlit,
+    dbt_packages,
+    target,
+    __pycache__
