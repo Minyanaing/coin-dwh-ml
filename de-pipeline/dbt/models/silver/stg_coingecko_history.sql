@@ -35,7 +35,8 @@ deduplicated as (
 select
     id                                    as coin_id,
     upper(symbol)                         as symbol,
-    name,
+    -- TEMP SCD2 test: rename avalanche-2 (dbt-only, revert after)
+    case when id = 'avalanche-2' then 'Avalanche 2.1' else name end as name,
     cast(price_date as date)              as price_date,
     cast(price as decimal(20, 8))         as price_usd,
     cast(market_cap as decimal(28, 2))    as market_cap_usd,
