@@ -32,6 +32,11 @@ on:
     paths:
       - 'de-pipeline/dbt/**'
   workflow_dispatch:            # manual button + cron-job.org API dispatch target
+    inputs:
+      full_refresh:
+        description: 'Rebuild incremental models from scratch (dbt --full-refresh)'
+        type: boolean
+        default: false
   repository_dispatch:
     types: [dbt-run]            # alternative external-cron trigger
 
@@ -88,4 +93,4 @@ jobs:
         working-directory: de-pipeline/dbt
         run: |
           dbt deps --profiles-dir .
-          dbt build --target dev --profiles-dir .
+          dbt build --target dev ${{ inputs.full_refresh && '--full-refresh' || '' }} --profiles-dir .
