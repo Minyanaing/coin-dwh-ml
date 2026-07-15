@@ -10,13 +10,26 @@
 -- Carries both the day's AVERAGE across its 6-hourly extracts and the value of
 -- the LATEST extract, plus how many extracts fed the average (extract_count).
 -- The day-over-day return is computed on the latest (close) price with lag()
--- over the FULL per-coin series, so it's correct even on incremental runs.
+-- over a bounded recent window (lag_lookback_days) — enough to see each
+-- reconsolidated day's prior day, so the return is correct without a full scan.
 -- coin_sk is resolved via an SCD Type-2 range join to dim_coin.
+
+{% set lag_lookback_days = 3 %}
 
 with daily as (
 
-    -- full series (unfiltered) so the lag() below is always correct
+    -- Bounded read (not a full scan): recent days + a short lookback so the lag()
+    -- below still sees each reconsolidated day's prior day. The final _synced_at
+    -- filter decides which of these rows actually get written.
+    -- Caveat: a backfill landing a price_date older than the lookback window is
+    -- not reprocessed here — widen lag_lookback_days (or --full-refresh) for that.
     select * from {{ ref('int_coin_daily') }}
+    {% if is_incremental() %}
+    where price_date >= (
+        select dateadd(day, -{{ lag_lookback_days }}, coalesce(max(price_date), '1900-01-01'::date))
+        from {{ this }}
+    )
+    {% endif %}
 
 ),
 
@@ -62,8 +75,8 @@ select
 from with_returns wr
 left join {{ ref('dim_coin') }} dc
     on  wr.coin_id = dc.coin_id
-    and cast(wr.price_date as timestamp_ntz) >= dc.valid_from
-    and cast(wr.price_date as timestamp_ntz) <  dc.valid_to
+    and wr.price_date >= dc.valid_from::date
+    and wr.price_date <  dc.valid_to::date
 
 {% if is_incremental() %}
 where wr._synced_at > (select coalesce(max(_synced_at), '1900-01-01'::timestamp_ntz) from {{ this }})
