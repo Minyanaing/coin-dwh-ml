@@ -2,3 +2,7 @@ requests==2.31.0
 snowflake-connector-python==3.13.2
 python-dotenv==1.0.1
 cryptography==42.0.5
+
+# lint / format (dev + CI)
+black==24.10.0
+flake8==7.1.1

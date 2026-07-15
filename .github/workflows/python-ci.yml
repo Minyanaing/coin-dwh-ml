@@ -1,0 +1,40 @@
+name: Python CI
+
+# Lint + format-check all Python. Runs only when Python (or the lint config)
+# changes. Mirror locally with, from repo root:
+#   pip install black==24.10.0 flake8==7.1.1
+#   black --check de-pipeline      # (drop --check to auto-format)
+#   flake8 de-pipeline
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.py'
+      - '.flake8'
+      - 'pyproject.toml'
+      - '.github/workflows/python-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: black + flake8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install linters
+        run: pip install black==24.10.0 flake8==7.1.1
+
+      - name: black --check (format)
+        run: black --check --diff de-pipeline
+
+      - name: flake8 (lint)
+        run: flake8 de-pipeline
