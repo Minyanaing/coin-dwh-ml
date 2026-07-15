@@ -30,6 +30,11 @@ name: dbt promote (qa / prod)
 
 on:
   workflow_dispatch:            # manual (pick branch main_qa/main_prod) + cron-job.org target
+    inputs:
+      full_refresh:
+        description: 'Rebuild incremental models from scratch (dbt --full-refresh)'
+        type: boolean
+        default: false
   repository_dispatch:
     types: [dbt-promote]        # alternative external-cron trigger
   push:
@@ -85,4 +90,4 @@ jobs:
         working-directory: de-pipeline/dbt
         run: |
           dbt deps --profiles-dir .
-          dbt build --target ${{ steps.t.outputs.target }} --profiles-dir .
+          dbt build --target ${{ steps.t.outputs.target }} ${{ inputs.full_refresh && '--full-refresh' || '' }} --profiles-dir .
