@@ -43,15 +43,19 @@ Full account-creation steps (key-pair generation, grants, one-time `ACCOUNTADMIN
 ```
 coin-dwh-ml/
 ├── .sqlfluff                        # dialect=snowflake, used by infra-ci.yml
+├── pyproject.toml                   # black config (line-length 100)
+├── .flake8                          # flake8 config (black-compatible)
 ├── .github/
 │   └── workflows/
 │       ├── infra-ci.yml             # PR: sqlfluff syntax check on snowflake/**
 │       ├── infra-deploy.yml         # merge to main: apply setup/streams/tasks to Snowflake (key-pair)
+│       ├── python-ci.yml            # PR touching **.py: black + flake8 lint
 │       ├── de-ingest.yml            # external cron (cron-job.org): run ingest_coingecko.py -> CRYPTO_DB.STG (standalone)
 │       ├── de-ingest-history.yml    # MANUAL only: backfill daily history -> COINGECKO_HISTORY_RAW
-│       ├── dbt-run.yml              # Step 5b: dbt CI (PR) + build DEV_DB (merge / external cron)
+│       ├── dbt-run.yml              # Step 5b: dbt CI (PR) + build DEV_DB (merge to main / cron; +full_refresh)
 │       ├── dbt-snowflake.yml        # Step 5a (disabled): recreate DBT PROJECT in Snowflake on merge
-│       └── dbt-promote.yml          # Step 6: build QA_DB or PROD_DB by `target` input (gated, per-env cron)
+│       ├── dbt-promote.yml          # Step 6: build QA_DB/PROD_DB by BRANCH (main_qa/main_prod; cron/dispatch only)
+│       └── streamlit-deploy.yml     # Step 8: deploy Streamlit app per env (branch-driven)
 └── de-pipeline/
     ├── ingestion/
     │   ├── config.py                     # env-based config (modes, coin set, creds) — shared
@@ -60,7 +64,7 @@ coin-dwh-ml/
     │   ├── transforms.py                 # round5() and other small shared helpers
     │   ├── ingest_coingecko.py           # daily snapshot (production + local; --format csv|json)
     │   ├── backfill_coingecko_history.py # manual historical daily backfill
-    │   ├── requirements.txt
+    │   ├── requirements.txt              # requests, snowflake-connector, dotenv, cryptography + black/flake8
     │   ├── .env.example                  # copy to .env (gitignored) for local runs
     │   └── data/                         # gitignored — local CSV/JSON output
     ├── dbt/                              # dbt project (Step 4)
@@ -68,7 +72,9 @@ coin-dwh-ml/
     │   ├── profiles.yml                  # dev/qa/prod targets -> DEV_DB/QA_DB/PROD_DB (key-pair)
     │   ├── packages.yml                  # dbt_utils
     │   ├── macros/
-    │   │   └── generate_schema_name.sql
+    │   │   ├── generate_schema_name.sql  # emit schema verbatim (no target prefix)
+    │   │   ├── create_schema.sql         # no-op: schemas are pre-created by setup.sql
+    │   │   └── reset_snapshots.sql       # drop snap_coin for a true SCD2 reset
     │   ├── snapshots/
     │   │   └── snap_coin.sql             # SCD Type-2 history behind dim_coin
     │   └── models/
@@ -90,7 +96,10 @@ coin-dwh-ml/
     │   ├── tasks.sql                # "new data" signal Task
     │   ├── ingest_task.sql          # DISABLED — Snowflake Task ingestion (needs External Access Integration)
     │   ├── dbt_project_task.sql     # DISABLED (Step 5a) — EXECUTE DBT PROJECT on a Task (billed account)
-    │   ├── run_sql.py               # applies *.sql via key-pair auth (used by infra-deploy.yml)
+    │   ├── streamlit-setup.sql      # Step 8: STREAMLIT_DB + per-env app (one env via ${STREAMLIT_ENV})
+    │   ├── streamlit/app.py         # Step 8: Streamlit dashboard (reads PROD_DB.GOLD_CRYPTO)
+    │   ├── streamlit-requirements.txt  # local Streamlit venv (streamlit, snowpark, pandas, altair, black, flake8)
+    │   ├── run_sql.py               # applies *.sql (+ put: file uploads) via key-pair auth
     │   └── requirements.txt         # snowflake-connector-python, cryptography
     ├── .keys/                       # gitignored — local rsa_key.p8 / rsa_key.pub
     └── README.md                    # service-account setup + local run instructions
@@ -230,7 +239,7 @@ dbt implements the medallion layers on top of the landing zone:
 ### Project layout & config (`de-pipeline/dbt/`)
 
 - **`dbt_project.yml`** — project `crypto_pipeline`; `silver/` builds into schema `silver_crypto` (all **incremental** tables), `gold/` into `gold_crypto`. Snapshots also land in `silver_crypto`.
-- **`profiles.yml`** — a single `dev` target pointing at `DEV_DB`. Authenticates as **`DEVELOPER_SVC` via key-pair** (role `SYSADMIN`), reading `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` / `SNOWFLAKE_PRIVATE_KEY_PATH` from `env_var`. qa/prod targets are added in the later deployment step.
+- **`profiles.yml`** — three targets (`dev` → `DEV_DB`, `qa` → `QA_DB`, `prod` → `PROD_DB`) sharing one **`DEVELOPER_SVC` key-pair** connection (role `SYSADMIN`), reading `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` / `SNOWFLAKE_PRIVATE_KEY_PATH` from `env_var`; only `database` differs per target. Promotion (Step 6) is just `--target qa` / `--target prod`.
 - **`packages.yml`** — `dbt_utils` (surrogate keys, date spine, extra tests).
 - **`macros/generate_schema_name.sql`** — emits the configured schema (`silver_crypto` / `gold_crypto`) verbatim instead of dbt's default target-prefixed name, so the same models build cleanly in any database.
 - **`macros/create_schema.sql`** — overrides dbt's `create_schema` to a no-op: the schemas are pre-created by `setup.sql`, so dbt only builds *into* them and never issues `CREATE SCHEMA`.
@@ -312,6 +321,7 @@ Until 5a is available, the dbt project runs on a **GitHub-hosted `ubuntu` runner
 - **PR touching `de-pipeline/dbt/**`** → the `ci` job: `dbt build` + tests, validating the change. *Note:* it builds into the shared `DEV_DB` schemas — there's no per-PR isolation, because `create_schema` is a no-op.
 - **Merge to `main`** touching `de-pipeline/dbt/**` → the `deploy-dev` job: rebuild `DEV_DB`.
 - **External cron** → `deploy-dev`, fired by **cron-job.org** hitting the GitHub REST API (`workflow_dispatch`; `repository_dispatch` type `dbt-run` is also wired). GitHub's built-in `schedule:` is deliberately avoided — it's delayed/dropped under load and only fires from the default branch (Step 3a); cron-job.org also lets you set the schedule directly in Bangkok time.
+- **Full-refresh** → a `full_refresh` boolean `workflow_dispatch` input appends `--full-refresh` when ticked (default off; the cron always runs incremental).
 
 - **cron-job.org job:** `POST https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-run.yml/dispatches`, headers `Authorization: Bearer <PAT>` / `Accept: application/vnd.github+json` / `X-GitHub-Api-Version: 2022-11-28`, body `{"ref":"main"}`, e.g. daily 08:30 Asia/Bangkok. The PAT is fine-grained (**Actions: read and write**) and lives only in the cron-job.org job header.
 - **Secrets used** (same key-pair as the other dbt/infra workflows): `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_DEV_SVC_USER` (= `DEVELOPER_SVC`), `SNOWFLAKE_DEV_SVC_PRIVATE_KEY`. The workflow writes the private key to `.keys/rsa_key.p8` at runtime and points `SNOWFLAKE_PRIVATE_KEY_PATH` at it; role is `SYSADMIN`.
@@ -325,22 +335,24 @@ Step 5 builds **dev**; Step 6 promotes the same dbt project up through **QA** an
 
 **Three targets in `profiles.yml`.** `dev` → `DEV_DB`, `qa` → `QA_DB`, `prod` → `PROD_DB`. Only `database` differs; account / user / private key / role come from the **same** env vars (`SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY_PATH`, `SNOWFLAKE_ROLE`) for all three, authenticating as the `DEVELOPER_SVC` key-pair (role `SYSADMIN`, which owns all three databases). So `profiles.yml` is the only per-environment knob and nothing environment-specific is hardcoded except the database name.
 
-**Two tracks, split by concern (both key-pair, both fired by external cron — Step 5b's reasoning):**
+**The environment is the branch.** `main` → dev (`DEV_DB`), `main_qa` → qa (`QA_DB`), `main_prod` → prod (`PROD_DB`). Each environment runs the code **frozen on its own branch**; you promote by merging **forward** (`main → main_qa → main_prod`), which updates that branch's code only. A dev change never reaches qa/prod until it's deliberately merged onward.
+
+**Two tracks, split by concern (both key-pair, both fired by external cron):**
 - **`dbt-run.yml` (Step 5b) = the dev track** — PR CI, merge-to-`main` deploy, and the daily cron build into `DEV_DB`.
-- **`dbt-promote.yml` (Step 6) = the qa/prod promotion track** — builds `QA_DB` or `PROD_DB`. It does **not** rebuild dev (that's `dbt-run.yml`'s job); it promotes the committed models onward.
+- **`dbt-promote.yml` (Step 6) = the qa/prod promotion track** — builds `QA_DB` or `PROD_DB`, chosen by the **branch it runs on**. It does not rebuild dev.
 
 ### The promotion workflow — `.github/workflows/dbt-promote.yml`
 
-It's **one parameterized job**, not a qa→prod chain. Every target shares identical credentials/secrets; the only thing that changes per environment is a `target` input (`qa` / `prod`) that selects the database via `profiles.yml`. So there are no per-env secrets or env vars — QA and PROD differ purely by which target you dispatch. This lets each environment run on its **own** external-cron schedule.
+It's **one job whose target is derived from the branch** (`github.ref_name`), not from an input — so the branch you run on fully decides the database and nothing can point qa code at the prod DB.
 
-- **The job:** resolves the target from `github.event.inputs.target` (workflow_dispatch) or `client_payload.target` (repository_dispatch), validates it's `qa`/`prod`, then runs `dbt deps` + `dbt build --target <target>`. `dbt build` runs models **+** the SCD2 snapshot **+** all tests, so a failing PK/FK/type test fails that environment's build.
-- **Gating with GitHub Environments:** the job's `environment:` is set to the chosen target, so the matching [environment](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment)'s required reviewers (Settings → Environments → `qa` / `prod`) gate that run; with no reviewers it proceeds straight through.
-- **Triggers (no GitHub `schedule:`):** `workflow_dispatch` (a `target` choice input — manual button + cron-job.org dispatch target) and `repository_dispatch` (type `dbt-promote`, `client_payload.target`).
+- **The job:** a `case` on `github.ref_name` maps `main_qa → --target qa` and `main_prod → --target prod` (any other branch errors out), then runs `dbt deps` + `dbt build --target <target>`. `dbt build` runs models **+** the SCD2 snapshot **+** all tests, so a failing PK/FK/type test fails that environment's build. A `full_refresh` boolean `workflow_dispatch` input appends `--full-refresh` when ticked (default off).
+- **Triggers — cron/dispatch only, never on push:** `workflow_dispatch` (manual "Run workflow" → pick the branch; also the cron-job.org target) and `repository_dispatch` (type `dbt-promote`). There is **no `push:` trigger** — merging into `main_qa` / `main_prod` updates the code but does *not* build; the scheduled cron (or a manual dispatch) on that branch does the build.
+- **Gating (two optional layers):** (1) **branch protection** on `main_qa` / `main_prod` — require a reviewed PR to promote code forward; (2) the job's `environment:` is set to `github.ref_name`, so GitHub **Environments** named `main_qa` / `main_prod` with required reviewers pause the build for approval.
 - **Auth & secrets:** the same `DEVELOPER_SVC` key-pair as every other workflow — `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_DEV_SVC_USER`, `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` (written to `.keys/rsa_key.p8` at runtime); role `SYSADMIN`.
 
-**cron-job.org — one job per environment** (each on its own schedule, staggered after the dev run): both `POST https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-promote.yml/dispatches` with the usual headers, differing only in the body's `inputs.target` — `{"ref":"main","inputs":{"target":"qa"}}` (e.g. 09:00 Bangkok) and `{"ref":"main","inputs":{"target":"prod"}}` (e.g. 10:00 Bangkok). Setup steps are in `README.md`.
+**cron-job.org — one job per environment** (each on its own schedule, staggered after the dev run): both `POST https://api.github.com/repos/<owner>/coin-dwh-ml/actions/workflows/dbt-promote.yml/dispatches` with the usual headers, differing only by the **branch in `ref`** — `{"ref":"main_qa"}` (e.g. 09:00 Bangkok) and `{"ref":"main_prod"}` (e.g. 10:00 Bangkok). `workflow_dispatch` runs the copy of the workflow living on that branch, so keep the branches synced by merging forward. Setup steps are in `README.md` §4.
 
-> Because all three environments read the same shared `CRYPTO_DB.STG` and run identical SQL, QA and PROD each build a complete, independent copy of the warehouse in their own database. The gate is organizational (per-env reviewer approval), not a data dependency — a late/failed dev run doesn't block promotion, it just means that build merges the same rows dev would have.
+> Because all three environments read the same shared `CRYPTO_DB.STG` and run identical SQL, QA and PROD each build a complete, independent copy of the warehouse in their own database. Isolation comes from the **branch** — qa/prod run the code frozen on their branch until you deliberately promote (merge) forward.
 
 ---
 
@@ -358,7 +370,20 @@ Every CI workflow — `infra-deploy.yml`, `de-ingest.yml` / `de-ingest-history.y
 
 The external-cron **GitHub PAT** (cron-job.org → `dbt-run.yml` / `dbt-promote.yml`, Steps 5b/6) is **not** a repo secret — it lives only in the cron-job.org job header.
 
-**Environments** — Go to **GitHub repo → Settings → Environments** and create `infra`, `qa`, and `prod`. Add required reviewers on each to gate, respectively: applying infra changes to Snowflake (`infra-deploy.yml`), the QA promotion, and the PROD promotion (`dbt-promote.yml`, whose single job runs in the environment named by its `target` input).
+**Environments** — Go to **GitHub repo → Settings → Environments** and create `infra`, `main_qa`, and `main_prod`. Add required reviewers on each to gate, respectively: applying infra changes to Snowflake (`infra-deploy.yml`), and the QA / PROD promotions — `dbt-promote.yml` sets `environment: ${{ github.ref_name }}`, so the environment is named after the branch it runs on. Optionally also protect the `main_qa` / `main_prod` **branches** so code can't be promoted forward without a reviewed PR.
+
+---
+
+## Step 8 — Streamlit dashboard (`snowflake/streamlit/app.py`)
+
+A **Streamlit-in-Snowflake** app that visualizes the Gold layer — it reads **`PROD_DB.GOLD_CRYPTO`** (`fct_daily_market` + `dim_coin`), the cleaned/promoted data, regardless of which environment the app object belongs to.
+
+- **Objects** live in a dedicated **`STREAMLIT_DB`** with a schema per env (`STREAMLIT_DEV` / `STREAMLIT_QA` / `STREAMLIT_PROD`) and a dedicated warehouse `STREAMLIT_WH`. There are three app objects (`CRYPTO_PRICES_DEV/QA/PROD`), all backed by the same `app.py` and all reading `PROD_DB`.
+- **`streamlit-setup.sql`** is a **single-environment** template driven by `${STREAMLIT_ENV}` — it creates the warehouse, `STREAMLIT_DB`, the env schema + code stage, one `CREATE OR REPLACE STREAMLIT`, and grants. It's **not** applied by `infra-deploy.yml` and is skipped by `infra-ci` (`.sqlfluffignore`), since `CREATE STREAMLIT` isn't in sqlfluff's dialect.
+- **Deploy — `streamlit-deploy.yml` (branch-driven).** On a push to `main` / `main_qa` / `main_prod` touching the streamlit files (or manual dispatch), it resolves the env from the branch, then runs `run_sql.py put:streamlit/app.py=@STREAMLIT_DB.STREAMLIT_<ENV>.CRYPTO_APP_STAGE streamlit-setup.sql` (`run_sql.py`'s `put:` step uploads `app.py` to the stage before `CREATE STREAMLIT`, which needs the file present). Same `DEVELOPER_SVC` key-pair.
+- **`app.py` is dual-mode:** inside Snowflake it uses `get_active_session()`; run locally it builds a Snowpark session from the same env vars — so the one file works both places. Local dev uses a **separate** venv (`.venv-streamlit`, `streamlit-requirements.txt`) because Snowpark's connector pin conflicts with dbt's.
+
+Full setup + local-run + deploy steps are in `README.md` §5.
 
 ---
 
@@ -382,18 +407,18 @@ Ingestion, the dev build, and dbt promotion run as independent workflows on stag
       ├── DEV_DB.SILVER_CRYPTO  (stg_coingecko_snapshot, stg_coingecko_history, int_coin_daily — incremental)
       └── DEV_DB.GOLD_CRYPTO    (dim_coin, dim_date, fct_market_snapshot, fct_daily_market + tests)
 
-~09:00 Bangkok — cron-job.org POST {"inputs":{"target":"qa"}}   — dbt-promote.yml (Step 6)
-└── Job: promote (environment=qa, gated by "qa" approval) — dbt build --target qa
+~09:00 Bangkok — cron-job.org POST {"ref":"main_qa"}   — dbt-promote.yml (Step 6)
+└── Job: promote (target=qa from branch; env main_qa, optional reviewer gate) — dbt build --target qa
       └── QA_DB.SILVER_CRYPTO + QA_DB.GOLD_CRYPTO   (same models + snapshot + tests)
 
-~10:00 Bangkok — cron-job.org POST {"inputs":{"target":"prod"}} — dbt-promote.yml (Step 6)
-└── Job: promote (environment=prod, gated by "prod" approval) — dbt build --target prod
+~10:00 Bangkok — cron-job.org POST {"ref":"main_prod"} — dbt-promote.yml (Step 6)
+└── Job: promote (target=prod from branch; env main_prod, optional reviewer gate) — dbt build --target prod
       └── PROD_DB.SILVER_CRYPTO + PROD_DB.GOLD_CRYPTO  (a failing test fails the build)
 
-(one parameterized workflow; each env has its own cron + schedule + `target` input — also runnable by hand)
+(the branch in `ref` picks the target — cron/dispatch only, never on push; `full_refresh` input on manual runs)
 ```
 
-The manual `de-ingest-history.yml` backfill (Step 3a) runs on demand, appending to `CRYPTO_DB.STG.COINGECKO_HISTORY_RAW`. Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.yml` (Deployment Step-1) independently, applying `setup.sql`/`streams.sql`/`tasks.sql`. `ingest_task.sql` (Step 3b) is excluded — it's disabled and has no effect until re-enabled.
+The manual `de-ingest-history.yml` backfill (Step 3a) runs on demand, appending to `CRYPTO_DB.STG.COINGECKO_HISTORY_RAW`. Merges to `main` touching `de-pipeline/snowflake/**` also trigger `infra-deploy.yml` (Deployment Step-1) independently, applying `setup.sql`/`streams.sql`/`tasks.sql`. Merges into `main_qa` / `main_prod`, by contrast, only update those branches' code — they do **not** trigger a build; QA/PROD build solely via their cron/dispatch (Step 6). `ingest_task.sql` (Step 3b) is excluded — it's disabled and has no effect until re-enabled.
 
 ---
 
@@ -405,7 +430,7 @@ The manual `de-ingest-history.yml` backfill (Step 3a) runs on demand, appending 
 
 **Custom `generate_schema_name` macro.** Without it, dbt would prefix `silver_crypto`/`gold_crypto` with the target's default schema (e.g. `public_silver_crypto`). The override makes the schema name identical across all three databases, so environment separation comes entirely from `database`, keeping profiles.yml as the only thing that changes per environment.
 
-**Incremental models over full refresh.** Silver uses `unique_key = ['id', 'fetched_at']` so dbt only merges new rows, not reprocessing full history, in whichever database it targets.
+**Incremental models over full refresh.** Silver/fact models are `incremental` with natural-key `unique_key`s (e.g. `stg_coingecko_snapshot` on `['coin_id','fetched_at']`, the daily models on `['coin_id','price_date']`), so dbt merges only new/touched rows rather than reprocessing full history. `fct_daily_market` reads a bounded recent window (not a full scan) to keep its day-over-day `lag()` correct, and resolves `coin_sk` by a **date-based** SCD2 range join. A manual `--full-refresh` (the `full_refresh` inputs, Steps 5b/6) rebuilds from scratch when needed.
 
 **Append-only landing table.** Raw data in `CRYPTO_DB.STG.COINGECKO_RAW` is never modified — every run appends rows with `fetched_at`. This gives a complete audit trail and lets you rebuild Silver/Gold in any environment from any past point in time.
 
@@ -417,6 +442,10 @@ The manual `de-ingest-history.yml` backfill (Step 3a) runs on demand, appending 
 
 **Snowflake Stream as a zero-cost trigger.** `APPEND_ONLY = TRUE` on the stream means Snowflake only tracks inserts, the cheapest change-tracking mode. `SYSTEM$STREAM_HAS_DATA` prevents the Task from consuming credits when there's nothing new — it exists purely as a monitoring signal, since the real Silver/Gold builds run through dbt.
 
-**One parameterized promotion workflow, gated by GitHub Environments.** `dbt-promote.yml` is a single job whose `target` (`qa`/`prod`) is chosen per dispatch and whose `environment:` is set to that same name — so per-env required reviewers gate the run and QA/PROD share one set of credentials, differing only by `--target`. Each environment gets its own external-cron schedule (a different `inputs.target` in the cron body), rather than a fixed qa→prod chain, so they can run independently at different times.
+**Branch = environment (GitOps promotion).** `main` / `main_qa` / `main_prod` map to dev / qa / prod; `dbt-promote.yml` derives `--target` from `github.ref_name`, so the branch fully decides the database and qa/prod run the code **frozen on their branch**. Promotion is a **forward merge** (`main → main_qa → main_prod`); the build then runs on cron / manual dispatch, **not** on the merge (`dbt-promote.yml` has no `push:` trigger). Isolation is real — a dev change can't reach prod until deliberately merged onward. `environment: ${{ github.ref_name }}` plus optional branch protection provide the gates.
 
 **PR CI builds against dev_db.** `dbt-run.yml`'s `ci` job runs a full `dbt build --target dev` (models + snapshot + tests) on every PR touching `de-pipeline/dbt/**`, so a broken model or a failing key/type test blocks the merge. It builds into the shared `DEV_DB` schemas — there's no per-PR schema isolation, since `create_schema` is a no-op — a deliberate simplification for a single-developer project; a larger team would swap in per-PR schemas or `state:modified+` selection.
+
+**Python lint in CI.** `python-ci.yml` runs `black --check` + `flake8` on every PR touching `**.py`; the linters are pinned in the requirements files and configured by root `pyproject.toml` / `.flake8` (black owns line length; flake8 ignores E203/W503/E501). Keeps ingestion, `run_sql.py`, and the Streamlit app consistently formatted.
+
+**On-demand full-refresh.** The scheduled crons always run **incremental**; `dbt-run.yml` and `dbt-promote.yml` each expose a `full_refresh` boolean `workflow_dispatch` input that appends `--full-refresh` for a manual from-scratch rebuild (e.g. to re-map history after an SCD2 / model change).
