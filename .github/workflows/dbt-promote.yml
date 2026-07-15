@@ -10,9 +10,10 @@ name: dbt promote (qa / prod)
 # derived from the branch name, so the branch you run on fully decides the target
 # database — there is no input that could point qa code at the prod database.
 #
-# Runs when:
-#   * push to main_qa / main_prod touching de-pipeline/dbt/**  (a promotion merge), or
-#   * external cron (cron-job.org) / manual dispatch on that branch.
+# Runs ONLY on external cron (cron-job.org) or manual workflow_dispatch — never on
+# push/merge. Promotion is a two-step: (1) merge forward (main -> main_qa -> main_prod)
+# to update the branch's code, then (2) the scheduled cron (or a manual Run workflow)
+# on that branch actually builds it. A merge alone does not rebuild qa/prod.
 #
 # cron-job.org selects the environment purely by the branch in `ref`:
 #   qa   -> body {"ref":"main_qa"}
@@ -37,10 +38,6 @@ on:
         default: false
   repository_dispatch:
     types: [dbt-promote]        # alternative external-cron trigger
-  push:
-    branches: [main_qa, main_prod]   # a promotion merge rebuilds that environment
-    paths:
-      - 'de-pipeline/dbt/**'
 
 permissions:
   contents: read
