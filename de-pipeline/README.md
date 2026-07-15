@@ -162,16 +162,16 @@ Once the one-time setup below is done, the pipeline runs itself. Work reaches Sn
 
 The cron job selects the environment **by the branch in `ref`** — `dbt-promote.yml` maps `main_qa → --target qa` and `main_prod → --target prod`. The stages are independent workflows (no hard `needs:`) — the stagger is a loose coupling, and because Silver/Gold are incremental, a late or missed upstream run just means that cycle merges fewer new rows rather than breaking.
 
-**B. On code change — GitHub-native CI/CD (branch = environment).** A push only rebuilds the environment whose branch you pushed to, so dev changes never leak into qa/prod:
+**B. On code change — GitHub-native CI/CD.** Only `main` (dev) plus the infra/lint checks run on push/PR. **QA and PROD never build on push** — merging forward only updates their branch code; the build runs on cron or manual dispatch (flow A / C):
 
 | You do | GitHub runs |
 |---|---|
+| Open a PR into `main` touching `**.py` | `python-ci.yml` — `black` + `flake8` |
 | Open a PR into `main` touching `de-pipeline/snowflake/**` | `infra-ci.yml` — `sqlfluff` parse (no credentials) |
 | Merge to `main` touching `de-pipeline/snowflake/**` | `infra-deploy.yml` — apply the SQL to Snowflake |
 | Open a PR into `main` touching `de-pipeline/dbt/**` | `dbt-run.yml` **ci** — `dbt build` + tests on `DEV_DB` |
 | Merge to `main` touching `de-pipeline/dbt/**` | `dbt-run.yml` — rebuild `DEV_DB` |
-| Merge `main → main_qa` (promote) | `dbt-promote.yml` — rebuild `QA_DB` |
-| Merge `main_qa → main_prod` (promote) | `dbt-promote.yml` — rebuild `PROD_DB` |
+| Merge `main → main_qa → main_prod` (promote) | *nothing on merge* — QA/PROD build on cron or manual dispatch |
 
 **C. Manual — any time.** Every workflow has a **Run workflow** button (**GitHub repo → Actions → _workflow_ → Run workflow**); for `dbt-promote.yml` **pick the branch** `main_qa` or `main_prod` (the branch decides the target). Ingestion and dev dbt also run locally (sections 2–3).
 
@@ -417,6 +417,8 @@ source .venv/bin/activate
 pip install -r ingestion/requirements.txt
 ```
 
+> `ingestion/requirements.txt` also pins `black` + `flake8`. PRs touching `**.py` are lint-gated by `python-ci.yml`; run it locally from the repo root with `black de-pipeline` and `flake8 de-pipeline` (config in `pyproject.toml` / `.flake8`).
+
 ### 2.2 Run in local mode (default — writes CSV, no Snowflake needed)
 
 ```cmd
@@ -640,6 +642,7 @@ Notes:
 - GitHub returns **`204 No Content`** on success (empty body); treat any `2xx` as OK in cron-job.org. A `401`/`403` means the PAT is wrong or missing the Actions permission; `404` usually means a wrong `<owner>`/repo/workflow filename or a token without access.
 - cron-job.org sends a `User-Agent` automatically (GitHub requires one); if you ever get a `403` about a missing User-Agent, add `User-Agent: cron-job.org` to the headers.
 - The workflow authenticates to Snowflake with the same `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_DEV_SVC_USER` / `SNOWFLAKE_DEV_SVC_PRIVATE_KEY` repo secrets used elsewhere — those must be set (project plan Step 6) for the dispatched run to succeed.
+- **Full-refresh (manual):** the cron always runs incremental; to rebuild the incremental models from scratch, run **Actions → dbt dev → Run workflow** and tick **`full_refresh`**.
 
 ---
 
@@ -653,7 +656,7 @@ Section 3 builds **dev** (`DEV_DB`) from `main`. QA and PROD are **separate bran
 | `main_qa` | `qa` | `QA_DB` | `dbt-promote.yml` |
 | `main_prod` | `prod` | `PROD_DB` | `dbt-promote.yml` |
 
-**Why branches?** Each environment runs the code **frozen on its branch**, so pushing a change to `main` (dev) does *not* touch qa/prod. You promote deliberately by merging forward — `main → main_qa → main_prod` — and only that merge rebuilds the next environment. `dbt/profiles.yml` still has all three targets sharing one `DEVELOPER_SVC` key-pair connection (env vars from §3.2); only the `database` differs, and `SYSADMIN` owns all four.
+**Why branches?** Each environment runs the code **frozen on its branch**, so pushing a change to `main` (dev) does *not* touch qa/prod. You promote deliberately by merging forward — `main → main_qa → main_prod` — which updates that environment's branch code; the rebuild then runs on cron or manual dispatch (§4.4), never on the merge itself. `dbt/profiles.yml` still has all three targets sharing one `DEVELOPER_SVC` key-pair connection (env vars from §3.2); only the `database` differs, and `SYSADMIN` owns all four.
 
 ### 4.1 Create the environment branches (one-time)
 
@@ -669,13 +672,13 @@ git branch main_prod && git push -u origin main_prod
 
 ### 4.2 Promote & gate
 
-**Promote** by merging forward — each merge rebuilds that environment (a `push` to `main_qa`/`main_prod` touching `de-pipeline/dbt/**` triggers `dbt-promote.yml`):
+**Promote** by merging forward — this only updates the branch's **code**. The merge does **not** trigger a build (`dbt-promote.yml` has no `push:` trigger); QA/PROD rebuild on their cron schedule (§4.4) or a manual dispatch:
 
 ```bash
 # dev looks good -> promote to QA
-git checkout main_qa && git merge --ff-only main && git push      # rebuilds QA_DB
+git checkout main_qa && git merge --ff-only main && git push       # updates main_qa code (QA builds on cron/dispatch)
 # QA looks good -> promote to PROD
-git checkout main_prod && git merge --ff-only main_qa && git push  # rebuilds PROD_DB
+git checkout main_prod && git merge --ff-only main_qa && git push  # updates main_prod code (PROD builds on cron/dispatch)
 ```
 
 **Gate** promotion two ways (both optional, both recommended for prod):
@@ -711,6 +714,8 @@ Create two cron-job.org jobs, identical except for **Schedule** and **Request bo
 | `dbt promote (prod)` | e.g. **10:00** | `{"ref":"main_prod"}` |
 
 The **`ref` is the whole switch** — GitHub runs `dbt-promote.yml` from that branch and the workflow maps `main_qa → --target qa`, `main_prod → --target prod`. Reuse the **same PAT** from §3.6 (fine-grained, **Actions: Read and write**); the `204`/`401`/`403`/`404` and `User-Agent` notes there apply here too. If Required Reviewers are set on the branch's Environment, the run waits on approval before building.
+
+> **Full-refresh (manual):** the cron jobs always run incremental. To rebuild the incremental models from scratch — e.g. to apply an SCD2/model change to historical rows — run **Actions → dbt promote (qa / prod) → Run workflow → pick the branch → tick `full_refresh`**.
 
 > You can also promote by hand any time: **Actions → dbt promote (qa / prod) → Run workflow → pick branch `main_qa` or `main_prod`** (the branch decides the target).
 
